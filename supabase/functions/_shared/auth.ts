@@ -109,7 +109,7 @@ export async function authenticateTenant(
  *
  * 평문은 호출부가 응답으로 1회 반환하고 버린다. 저장하지 않는다.
  */
-export async function generateApiKey(
+export async function issueApiKey(
   env: Env,
 ): Promise<{ plain: string; keyHash: string; keyPrefix: string }> {
   const bytes = new Uint8Array(24);

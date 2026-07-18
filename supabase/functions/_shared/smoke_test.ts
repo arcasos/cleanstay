@@ -1,4 +1,4 @@
-import { generateApiKey, sha256Hex } from "./auth.ts";
+import { issueApiKey, sha256Hex } from "./auth.ts";
 import { corsHeaders, handlePreflight } from "./cors.ts";
 import { errorResponse } from "./errors.ts";
 
@@ -6,14 +6,14 @@ let fail = 0;
 const ok = (c: boolean, m: string) => { console.log(`${c ? "PASS" : "FAIL"}  ${m}`); if (!c) fail++; };
 
 // --- API 키 생성 ---
-const k = await generateApiKey("live");
+const k = await issueApiKey("live");
 ok(/^ck_live_[0-9a-f]{48}$/.test(k.plain), `형식 ck_live_<48hex>: ${k.plain.slice(0,20)}...`);
 ok(k.keyPrefix === k.plain.slice(0,16) && k.keyPrefix.length === 16, `key_prefix 16자: ${k.keyPrefix}`);
 ok(k.keyHash === await sha256Hex(k.plain), "key_hash = sha256(평문)");
 ok(k.keyHash.length === 64, "sha256 hex 64자");
-const t = await generateApiKey("test");
+const t = await issueApiKey("test");
 ok(t.plain.startsWith("ck_test_"), "test env 접두");
-ok((await generateApiKey("live")).plain !== k.plain, "매번 다른 키");
+ok((await issueApiKey("live")).plain !== k.plain, "매번 다른 키");
 
 // sha256 알려진 벡터
 ok(await sha256Hex("abc") === "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "sha256('abc') 표준 벡터");
