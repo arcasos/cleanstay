@@ -1,0 +1,7 @@
+{
+  "//": "Edge Function 런타임 설정. 루트 node_modules(Vite 프론트용)를 Deno가 집어들지 않도록 격리한다.",
+  "nodeModulesDir": "none",
+  "imports": {
+    "@supabase/supabase-js": "jsr:@supabase/supabase-js@^2.110.2"
+  }
+}
