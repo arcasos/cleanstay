@@ -18,7 +18,7 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   base,
   build: {
-    sourcemap: true,
+    sourcemap: false,
     outDir: "out",
   },
   resolve: {

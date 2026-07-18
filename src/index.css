@@ -64,11 +64,14 @@ layer(base);
   --color-foreground-900: oklch(var(--foreground-900));
   --color-foreground-950: oklch(var(--foreground-950));
 
+  /* 폰트는 여기서만 선언한다. 레이어 밖 :root에 같은 이름으로 다시 두면
+     자기참조(--font-body: var(--font-body))가 되어 캐스케이드 순서에만
+     기대게 된다. */
+  --font-body: 'Noto Sans KR', sans-serif;
+  --font-heading: 'Noto Sans KR', sans-serif;
+  --font-label: 'Noto Sans KR', sans-serif;
   --font-sans: var(--font-body);
-  --font-body: var(--font-body);
-  --font-heading: var(--font-heading);
   --font-display: var(--font-heading);
-  --font-label: var(--font-label);
 }
 
 /*
@@ -90,10 +93,6 @@ layer(base);
 }
 
 :root {
-  --font-body: 'Noto Sans KR', sans-serif;
-  --font-heading: 'Noto Sans KR', sans-serif;
-  --font-label: 'Noto Sans KR', sans-serif;
-
   --background-50: 0.972 0.007 252;
   --background-100: 0.955 0.009 252;
   --background-200: 0.926 0.014 252;
