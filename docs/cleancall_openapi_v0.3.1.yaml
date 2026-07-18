@@ -1,0 +1,1435 @@
+openapi: 3.1.0
+
+info:
+  title: CLEANCALL API
+  version: 0.3.1-draft
+  summary: STR 턴오버 청소 발주·배차 API
+  description: |
+    숙박·단기임대 플랫폼이 퇴실 청소를 자동 발주하기 위한 API입니다.
+
+    ## v0.3.1 변경 (ARCASOS v0.3 회신 반영)
+    - **`free_change_until` 불리한 소급 방지** — 공급자 사유로 `scheduled_at`이 앞당겨져도
+      호스트의 무보상 시한은 줄어들지 않습니다
+    - **확정·청구·보상 타임라인 명시** — 자동 확정 시한, 클레임 접수 기한, 공급자 지급 시점
+    - `OrderDetail.access_update_url` — 재조회 가능
+    - 보상금 **지급 경로 명시** (클린콜 → 호스트 직접)
+    - `fault` **판정 주체 명시** (테넌트 값은 참고, 클린콜이 최종 판정)
+    - sandbox `scheduled_at` 오버라이드
+    - `order.access_info_stale` 이벤트 — 청소 임박 시 미갱신 경고
+    - `servers` URL 확정 (개발 단계)
+
+    > ⚠️ **v0.2 → v0.3 경로 변경**: `/orders/{id}/claim` → **`/orders/{id}/claims`**
+    > (단수 → 복수, `POST` 추가에 따름). v0.2 기준으로 작업하신 경우 확인해 주십시오.
+
+    ## v0.3 변경 (ARCASOS v0.2 회신 반영)
+    - **출입 정보를 2층으로 분리** — 매물 단위(고정) / 발주 단위(도어락, 게스트마다 변경)
+      발주 응답에 `access_update_url` 반환. 호스트가 그 건에만 적용되는 값을 갱신합니다.
+    - `access_info.updated_at` 노출 + `access_info_stale` warning
+    - `order.rescheduled` 이벤트 추가 — `scheduled_at` 변경 통지
+    - `order.billing_verified` → **`order.dispatch_unblocked`** 로 개명
+    - `PATCH`·`cancel` 에 `dry_run` 추가. `Order.free_change_until` 상시 노출
+    - `POST /orders/{id}/claims` — 테넌트가 호스트 대신 클레임 접수
+    - 설정 링크 **매물 일괄 처리** (`property_ids` 배열, 생략 시 미등록 전체)
+    - **`urgent_premium` 현재 0 확정** — 정책 도입 시 60일 전 통지
+    - 좌표계 **WGS84** 명시
+    - 배차 전 건은 **무조건 무보상** 명시
+
+    ## v0.2 변경 (ARCASOS v0.1 회신 반영)
+    - `scheduled_at` / `arrival_at` 추가 — 청소 예정·도착 시각
+    - **출입 정보** 도입. 단 테넌트가 전송하지 않고 **호스트가 직접 등록**합니다(§ 출입 정보)
+    - webhook에 `sequence` + `occurred_at` 추가 — 순서 보장
+    - `region_code` 선택화. `address` 또는 `lat`/`lng` 로 서버측 해석
+    - 미지원 지역도 `pending_coverage` 로 등록 수용. `GET /coverage` 추가
+    - `trigger_type` 에 `rework` 추가
+    - 호스트 `phone`/`email` 선택 — 미전송이 기본
+    - `order.paid_out` webhook 제거
+    - 마감 기한 규칙 명시 (`next_checkin_at` 없으면 `checkout_at + N시간`)
+    - 테스트 키 + 상태 강제 전이 API (sandbox 1차)
+    - `POST /orders/{id}/messages` — 공급자 중계 연락
+
+    ## 핵심 개념
+    - **테넌트(Tenant)** — 발주하는 플랫폼. API 키 발급 단위.
+    - **호스트(Host)** — 청소값을 결제하는 매물 소유자. 클린콜에 직접 결제합니다.
+    - **매물(Property)** — 청소 대상. 발주 전에 등록되어 있어야 합니다.
+    - **발주(Order)** — 하나의 턴오버 청소 건.
+
+    ## 결제 구조
+    청소비는 **호스트가 클린콜에 직접 결제**합니다(빌링키). 테넌트는 자금 흐름에
+    관여하지 않고 발주 이벤트만 전달합니다. 세금계산서도 클린콜이 호스트에게 발행합니다.
+
+    결제 타이밍은 **발주 시 유효성 검증 / 완료 후 실제 청구**입니다.
+    취소 건은 애초에 청구가 없으므로 환불 개념이 없습니다.
+
+    ## 상태 ↔ webhook 이벤트 매핑
+    | status | webhook event | 설명 |
+    |---|---|---|
+    | `created` | — | 발주 생성. 결제수단 미확인 상태 |
+    | `billing_verified` | `order.dispatch_unblocked` | 배차 게이트 통과(결제수단·출입정보 모두 충족) |
+    | `broadcasting` | — | 공급자에게 콜 오퍼 발송 중 |
+    | `accepted` | `order.dispatched` | 공급자 수락. `scheduled_at` 확정 |
+    | `accepted` (재전이) | `order.rescheduled` | `scheduled_at` 변경. 상태는 그대로 |
+    | `accepted` (경고) | `order.access_info_stale` | 청소 6시간 전인데 출입 정보 미갱신 |
+    | `in_progress` | `order.in_progress` | 청소 시작. `arrival_at` 기록 |
+    | `completed` | `order.completed` | 완료 보고(사진·체크리스트) |
+    | `confirmed` | `order.confirmed` | 호스트 확인 또는 자동 확정 |
+    | `charged` | `order.charged` | 실제 청구 성공 |
+    | `paid_out` | — | 공급자 지급 완료. **테넌트에 통지하지 않음** |
+    | `escalated` | `order.failed`(`stage: escalated`) | 전 웨이브 미수락 |
+    | `reassigning` | `order.failed`(`stage: reassigning`) | 노쇼·취소로 재배차 중 |
+    | `backup_dispatch` | `order.dispatched` | 백업 배차 확정 |
+    | `cancelled` | `order.cancelled` | 취소 |
+    | `failed` | `order.failed` | 미배차·결제실패 등 최종 실패 |
+
+    ## 확정 · 청구 · 보상 타임라인
+
+    ```
+    completed        공급자 완료 보고(사진·체크리스트)
+      ↓
+    confirmed        호스트 확인 또는 자동 확정
+                     자동 확정 시각 = max( completed_at + 6시간, deadline_at )
+      ↓
+    charged          호스트에게 실제 청구
+      ↓  (클레임 기한 경과 후)
+    paid_out         공급자 지급
+    ```
+
+    ### 자동 확정
+    ```
+    auto_confirm_at = max( completed_at + 6h, deadline_at )
+    ```
+    `deadline_at`(다음 입주 시점 또는 `checkout_at + cleaning_deadline_hours`)
+    **이전에는 확정되지 않습니다.** 불량이 발견될 수 있는 최초 시점 전에 확정하면
+    검증 기회가 사라지기 때문입니다.
+
+    하한 6시간은 호스트가 완료 알림을 받고 확인할 최소 시간입니다.
+
+    ### 클레임 접수 기한
+    **완료 보고(`completed`) 후 7일**까지 `POST /orders/{id}/claims` 로 접수 가능합니다.
+
+    **`confirmed`·`charged` 이후에도 접수할 수 있습니다.** 확정은 청구를 진행시키는
+    절차일 뿐이고, 보상은 별도 트랙입니다. 다음 게스트가 입주한 뒤 불량이
+    발견되는 경우를 고려한 설계입니다.
+
+    ### 공급자 지급
+    클레임 기한(7일)이 지난 뒤 정산 주기에 지급합니다.
+    기한 내 클레임이 접수되면 해당 건의 지급이 보류되며, 판정 후 처리됩니다.
+
+    ### 보상금 지급 경로
+    승인된 보상금(`Claim.approved_amount`)은 **클린콜이 호스트에게 직접 지급**합니다.
+    테넌트는 자금 흐름에 관여하지 않습니다.
+
+    ## 운영 규약
+    - **버저닝** — `/v1` 경로 고정. breaking change는 최소 **60일 전 통지** 후 `/v2` 신설.
+      필드 추가는 breaking change가 아니므로 클라이언트는 미지의 필드를 무시해야 합니다.
+    - **Rate limit** — 기본 600 req/min. 일괄 등록 등 초과가 필요하면 사전 협의.
+      초과 시 `429` + `Retry-After`.
+    - **발신 IP** — webhook 발신 IP 대역은 도메인 확정 시 공지합니다.
+
+    ## ⚠️ 이 문서는 초안입니다
+    `x-open-question` 으로 표시된 항목은 확정되지 않았습니다.
+  x-status: 검토용 프로토타입 — 구현 전
+  x-pricing-policy: |
+    긴급 프리미엄(`urgent_premium`)은 **현재 0원입니다.**
+    중도퇴실 빈도·원가 데이터가 축적되지 않은 상태에서 근거 없는 금액을 부과하지 않습니다.
+    향후 정책을 도입할 경우 **최소 60일 전에 통지**하며, 도입 시 발생 조건과 상한을
+    함께 명시합니다. 그 전까지 `amounts.urgent_premium`은 항상 0입니다.
+  x-out-of-scope: |
+    - 예상 단가 조회(quote) — 필요성은 인정하나 원가 데이터 축적 후 제공 예정
+    - webhook 테스트 재발송 — sandbox 2차
+    - 반경(km) 기반 매칭 — 현재는 행정구역 접두만
+
+servers:
+  - url: https://eufiudomekvefcldglap.supabase.co/functions/v1
+    description: |
+      개발 환경. 자체 도메인 확정 시 `api.<도메인>/v1` 로 이관하며,
+      **경로 구조는 동일**하므로 베이스 URL만 교체하시면 됩니다.
+      이관 시점은 최소 30일 전에 통지합니다.
+
+security:
+  - apiKey: []
+
+tags:
+  - name: Properties
+  - name: Orders
+  - name: Billing
+  - name: Coverage
+  - name: Claims
+  - name: Sandbox
+
+paths:
+
+  # ==================================================================
+  /coverage:
+    get:
+      tags: [Coverage]
+      summary: 서비스 지원 지역 조회
+      description: |
+        현재 청소 배차가 가능한 지역 목록입니다.
+        호스트 대시보드에 "우리 지역 지원 여부"를 표시하는 용도로 사용하십시오.
+
+        커버리지는 **공급자 확보 상황에 따라 변합니다.** 테넌트가 자체 판단 로직을
+        들고 있지 마시고 이 엔드포인트를 참조하십시오.
+      operationId: getCoverage
+      security: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  regions:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        region_code:
+                          type: string
+                          description: 법정동코드 접두 (2·5·10자리)
+                          examples: ['11680']
+                        name: { type: string, examples: ['서울특별시 강남구'] }
+                        level: { type: string, enum: [city, gu, dong] }
+                  updated_at: { type: string, format: date-time }
+
+  /coverage/check:
+    post:
+      tags: [Coverage]
+      summary: 주소·좌표의 지원 여부 확인
+      description: 매물 등록 전에 미리 확인할 때 사용합니다.
+      operationId: checkCoverage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                address: { type: string }
+                lat: { type: number }
+                lng: { type: number }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  region_code: { type: [string, 'null'] }
+                  region_name: { type: [string, 'null'] }
+                  serviceable: { type: boolean }
+
+  # ==================================================================
+  /properties:
+    post:
+      tags: [Properties]
+      summary: 매물 등록
+      description: |
+        발주하려면 매물이 먼저 등록되어야 합니다.
+        호스트는 별도 가입 절차 없이 이 요청으로 **자동 생성**됩니다.
+
+        ### 지역 코드 해석 (v0.2 변경)
+        `region_code`는 **선택**입니다. 없으면 `lat`/`lng` 또는 `address`로
+        서버가 법정동코드를 해석하고 **응답에 반환**합니다.
+        반환된 값을 저장해두면 다음부터 그대로 보내셔도 됩니다.
+
+        정확도 우선순위: `region_code` > `lat`/`lng` > `address`
+        좌표가 있으면 함께 보내주십시오. 주소 문자열 파싱보다 정확합니다.
+
+        ### 미지원 지역 (v0.2 변경)
+        서비스 지역 밖이어도 **등록은 받습니다.** `status`가 `pending_coverage`가 되고
+        발주만 불가합니다. 커버리지가 확장되어 활성화되면 `property.activated`
+        webhook이 발송됩니다.
+
+        ### 호스트 개인정보
+        `phone`/`email`은 **선택이며 미전송이 기본**입니다.
+        연락처와 결제 동의는 클린콜이 호스트에게서 직접 수집합니다.
+        테넌트가 대신 전송·동의할 경우 개인정보 제3자 제공 이슈가 발생합니다.
+      operationId: createProperty
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PropertyCreate' }
+      responses:
+        '201':
+          description: 등록됨
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PropertyCreated' }
+        '200':
+          description: 이미 등록된 매물. 기존 값 반환
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PropertyCreated' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422':
+          description: |
+            입력값 오류. 지역 해석 실패 시 `region_unresolved` 코드가 반환됩니다
+            (미지원 지역은 오류가 아니라 `pending_coverage`입니다).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /properties/{property_id}:
+    parameters: [{ $ref: '#/components/parameters/PropertyId' }]
+    get:
+      tags: [Properties]
+      summary: 매물 조회
+      operationId: getProperty
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PropertyDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Properties]
+      summary: 매물 수정
+      operationId: updateProperty
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PropertyUpdate' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PropertyDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ==================================================================
+  /hosts/{host_id}/setup/link:
+    parameters:
+      - name: host_id
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      tags: [Billing]
+      summary: 호스트 설정 링크 발급 (결제수단 + 출입 정보)
+      description: |
+        호스트가 **직접** 결제수단과 출입 정보를 등록하는 페이지 링크를 발급합니다.
+        발급된 링크를 호스트에게 전달하십시오(알림톡·메일·플랫폼 내 알림 등).
+
+        ### 왜 테넌트가 대신 등록하지 않는가
+
+        **결제 동의** — 빌링키 등록·정기결제·개인정보 처리 동의는 전자금융거래법·
+        개인정보보호법상 본인이 해야 합니다. 테넌트가 대신할 수 없습니다.
+
+        **출입 정보** — 도어락 비밀번호·키박스 위치는 유출 시 주거 침입으로
+        직결됩니다. 테넌트를 경유시키지 않는 것이 양쪽 모두의 책임을 줄입니다.
+        테넌트는 이 값을 보유하지도 전달하지도 않습니다.
+
+        ### 출입 정보는 2층입니다 (v0.3)
+        | 층 | 내용 | 변경 빈도 | 등록 경로 |
+        |---|---|---|---|
+        | 매물 단위 | 공동현관·키박스 위치·주차·엘리베이터 안내 | 거의 없음 | 이 링크 |
+        | 발주 단위 | 도어락 비밀번호 | **게스트마다** | `OrderCreated.access_update_url` |
+
+        도어락 비밀번호는 게스트 교체마다 바뀌므로 매물에 한 번 저장해두면 낡습니다.
+        발주 단위 갱신 링크를 체크아웃 안내에 끼워 전달해 주십시오.
+
+        `scope`로 필요한 항목만 요청할 수 있습니다.
+      operationId: createSetupLink
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                scope:
+                  type: array
+                  items: { type: string, enum: [billing, access_info] }
+                  default: [billing, access_info]
+                property_ids:
+                  type: array
+                  items: { type: string, format: uuid }
+                  description: |
+                    출입 정보를 등록할 매물들. **생략하면 해당 호스트의
+                    미등록 매물 전체**를 한 페이지에서 입력합니다(v0.3 변경).
+                    매물별로 링크를 나눠 보내면 호스트가 이탈합니다.
+                mode:
+                  type: string
+                  enum: [hosted_link, oauth, embed]
+                  default: hosted_link
+                redirect_url: { type: string, format: uri }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  host_id: { type: string, format: uuid }
+                  url: { type: string, format: uri }
+                  scope:
+                    type: array
+                    items: { type: string }
+                  expires_at: { type: string, format: date-time }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ==================================================================
+  /orders:
+    post:
+      tags: [Orders]
+      summary: 발주 생성
+      description: |
+        턴오버 청소를 발주합니다.
+
+        ### 호출 시점
+        예약의 **체크인 시점**에 호출하십시오. 청소는 그 예약의 체크아웃 이후에
+        수행됩니다. 체크인 이후에는 취소율이 낮아 리드타임과 확실성을 동시에 얻습니다.
+
+        ### 청소 마감 기한 (v0.2 명시)
+        ```
+        마감 = next_checkin_at            (있으면 우선)
+             = checkout_at + N시간         (없으면. N 기본값 24)
+        ```
+        `N`은 매물 단위로 조정 가능합니다(`PropertyCreate.cleaning_deadline_hours`).
+        `next_checkin_at`은 **선택 힌트**이며 필수 전제가 아닙니다.
+        나중에 다음 예약이 확정되면 `PATCH /orders/{id}`로 채워주십시오.
+
+        ### 멱등성
+        `(tenant_ref, trigger_type)` 조합으로 중복이 차단됩니다.
+        타임아웃·재시도 시 **그냥 다시 호출하십시오.** 기존 발주가 반환됩니다.
+
+        재청소가 필요하면 `trigger_type: rework`로 호출하십시오.
+        `scheduled`와 멱등키가 분리되어 별도 발주가 생성됩니다.
+
+        ### 결제수단·출입정보 미등록
+        미등록이어도 **발주는 생성됩니다.** 다만 배차가 보류되고 응답에 `warnings`가
+        담깁니다. 호스트에게 설정 링크를 안내하십시오.
+        등록이 완료되면 자동으로 배차가 재개됩니다.
+      operationId: createOrder
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OrderCreate' }
+      responses:
+        '201':
+          description: 생성됨
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderCreated' }
+        '200':
+          description: 멱등 재요청 — 기존 발주 반환
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderCreated' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            발주 불가. `property_pending_coverage`(미지원 지역),
+            `property_inactive` 등.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+    get:
+      tags: [Orders]
+      summary: 발주 목록 조회 (reconciliation)
+      description: |
+        **webhook 유실 대비 대조용입니다.** 권장 주기 10분.
+        불일치 시 클린콜 값이 정답입니다(클린콜이 발주 원장의 SoR).
+
+        ### 커서 규약 (v0.2 명시)
+        - `updated_since`는 **`>=`** 로 동작합니다. 경계 건이 중복 수신될 수 있으나
+          **누락되지 않습니다.**
+        - 정렬은 `(updated_at ASC, order_id ASC)` 복합 키입니다.
+          동일 시각에 복수 건이 갱신되어도 커서가 건너뛰지 않습니다.
+        - `next_cursor`가 `null`이면 마지막 페이지입니다.
+      operationId: listOrders
+      parameters:
+        - name: updated_since
+          in: query
+          schema: { type: string, format: date-time }
+          description: 이 시각 **이상**(>=) 갱신된 발주
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/OrderStatus' }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, maximum: 200 }
+        - name: cursor
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  orders:
+                    type: array
+                    items: { $ref: '#/components/schemas/Order' }
+                  next_cursor: { type: [string, 'null'] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /orders/{order_id}:
+    parameters: [{ $ref: '#/components/parameters/OrderId' }]
+    get:
+      tags: [Orders]
+      summary: 발주 상세 조회
+      operationId: getOrder
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Orders]
+      summary: 발주 변경
+      description: |
+        예약 변경(연장·연속 거주 등)으로 청소 시각이 바뀔 때 호출합니다.
+
+        ### 변경 가능 시한과 귀책
+        x-open-question 참조. 현재 제안값은 다음과 같습니다.
+
+        | 시점 | 처리 |
+        |---|---|
+        | **배차 전** (`created`·`billing_verified`·`broadcasting`) | **무조건 무보상** |
+        | 청소 예정 시각(`scheduled_at`) **24시간 전**까지 | 무보상 변경 |
+        | 24시간 이내 | 취소보상 발생, 귀책 `tenant` |
+        | `in_progress` 이후 | 변경 불가 (409) |
+
+        현재 무보상 시한은 `Order.free_change_until` 로 상시 조회할 수 있습니다.
+        배차 전이면 `null`이며 언제든 무보상입니다.
+
+        ### 사전 확인 (v0.3 추가)
+        `dry_run: true` 로 호출하면 **실제 변경 없이** 보상 발생 여부만 반환합니다.
+        호스트에게 사전 안내한 뒤 실제 호출하십시오.
+
+        ### 연기와 청구
+        `checkout_at`을 미루는 것은 **추가 청구를 발생시키지 않습니다.**
+        발주가 새로 생기는 것이 아니라 기존 발주가 이동하는 것이므로,
+        연속 거주 시에도 청소 1회 · 청구 1회로 정합합니다.
+
+        `accepted` 상태에서 변경하면 배차된 공급자에게 통지됩니다.
+        공급자가 새 시각을 수락하지 못하면 재배차가 일어나고
+        `order.failed`(`stage: reassigning`) → `order.dispatched` 순으로 통지됩니다.
+
+        `next_checkin_at`을 나중에 채우는 경우에도 마감이 당겨지면 동일하게
+        공급자에게 통지되며, 공급자가 수용 불가하면 재배차됩니다.
+      operationId: updateOrder
+      x-open-question: |
+        ⚠️ 무보상 변경 시한(24시간)과 귀책 기준은 공급자 계약·약관과 함께
+        확정되어야 합니다. 현재는 제안값입니다.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OrderUpdate' }
+      responses:
+        '200':
+          description: |
+            변경됨. `dry_run: true` 인 경우 변경 없이 `change_preview`만 반환됩니다.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/OrderDetail'
+                  - type: object
+                    properties:
+                      change_preview: { $ref: '#/components/schemas/ChangePreview' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /orders/by-ref/{tenant_ref}:
+    parameters:
+      - name: tenant_ref
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [Orders]
+      summary: 테넌트 참조 ID로 발주 조회
+      description: |
+        한 예약에 복수 발주가 있을 수 있습니다
+        (중도퇴실로 인한 긴급 발주, 재청소 등).
+      operationId: getOrderByRef
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  orders:
+                    type: array
+                    items: { $ref: '#/components/schemas/OrderDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /orders/{order_id}/cancel:
+    parameters: [{ $ref: '#/components/parameters/OrderId' }]
+    post:
+      tags: [Orders]
+      summary: 발주 취소
+      description: |
+        예약 취소 시 호출합니다.
+        **청구는 애초에 없으므로 환불 처리가 불필요합니다.**
+
+        변경과 동일한 시한·귀책 기준이 적용됩니다(`PATCH /orders/{id}` 참조).
+      operationId: cancelOrder
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string }
+                fault: { $ref: '#/components/schemas/FaultParty' }
+                dry_run:
+                  type: boolean
+                  default: false
+                  description: true면 취소하지 않고 보상 발생 여부만 반환합니다 (v0.3).
+      responses:
+        '200':
+          description: 취소됨 (`dry_run` 시 `change_preview`만 반환)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderDetail' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /orders/{order_id}/early-checkout:
+    parameters: [{ $ref: '#/components/parameters/OrderId' }]
+    post:
+      tags: [Orders]
+      summary: 중도퇴실 처리
+      description: |
+        게스트가 예정보다 일찍 퇴실한 경우 호출합니다.
+        기존 발주를 취소하고 **긴급 발주를 새로 생성**합니다.
+
+        ⚠️ **호스트 확인을 거친 뒤 호출하십시오.** 자동 감지만으로 호출하면
+        오배차가 발생합니다.
+      operationId: earlyCheckout
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [actual_checkout_at]
+              properties:
+                actual_checkout_at: { type: string, format: date-time }
+                confirmed_by: { type: string, enum: [host, operator] }
+      responses:
+        '201':
+          description: 긴급 발주 생성됨
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  cancelled_order_id: { type: string, format: uuid }
+                  new_order_id: { type: string, format: uuid }
+                  priority: { type: string, const: urgent }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /orders/{order_id}/messages:
+    parameters: [{ $ref: '#/components/parameters/OrderId' }]
+    post:
+      tags: [Orders]
+      summary: 공급자에게 메시지 전달 (중계)
+      description: |
+        현장 문제(출입 불가, 도어락 오류, 파손 발견 등) 발생 시
+        **클린콜이 중계**하여 공급자에게 전달합니다.
+
+        공급자 연락처를 직접 노출하지 않으면서 소통 경로를 확보하기 위한 것입니다.
+        배차 확정(`accepted`) 이후에만 사용 가능합니다.
+      operationId: sendOrderMessage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [body]
+              properties:
+                body: { type: string, maxLength: 1000 }
+                urgent:
+                  type: boolean
+                  default: false
+                  description: true면 SMS·전화 등 즉시 경로로 전달됩니다
+      responses:
+        '202':
+          description: 전달 접수됨
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message_id: { type: string, format: uuid }
+                  delivered_via:
+                    type: array
+                    items: { type: string, enum: [app_push, sms, call] }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    get:
+      tags: [Orders]
+      summary: 메시지 이력 조회
+      operationId: listOrderMessages
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  messages:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        message_id: { type: string, format: uuid }
+                        direction: { type: string, enum: [to_provider, from_provider] }
+                        body: { type: string }
+                        at: { type: string, format: date-time }
+
+  /orders/{order_id}/claims:
+    parameters: [{ $ref: '#/components/parameters/OrderId' }]
+    post:
+      tags: [Claims]
+      summary: 클레임 접수 (v0.3 추가)
+      description: |
+        청소 불량·파손 등을 **테넌트가 호스트를 대신하여** 접수합니다.
+
+        호스트는 클린콜에 상시 로그인하지 않습니다(설정 링크로 1회 등록하는 것이
+        전부입니다). 따라서 호스트가 테넌트 대시보드에 신고한 건을 이 경로로
+        전달해 주십시오.
+
+        접수 후 처리 상태는 `claim.updated` webhook으로 통지됩니다.
+
+        ### 접수 기한 (v0.3.1 명시)
+        **완료 보고(`completed`) 후 7일**까지 접수 가능합니다.
+        `confirmed`·`charged` 이후에도 접수할 수 있습니다 — 확정은 청구를 진행시키는
+        절차일 뿐이고 보상은 별도 트랙입니다.
+        다음 게스트가 입주한 뒤 불량이 발견되는 경우를 고려한 설계입니다.
+
+        기한 경과 시 `409 claim_window_closed` 를 반환합니다.
+      operationId: createClaim
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type, description]
+              properties:
+                type:
+                  type: string
+                  enum: [cleaning_defect, property_damage, other]
+                description: { type: string, maxLength: 2000 }
+                photos:
+                  type: array
+                  description: 호스트가 제출한 증빙 사진 URL
+                  items: { type: string, format: uri }
+                claimed_amount:
+                  type: [integer, 'null']
+                  description: 호스트가 청구하는 금액(원). 미정이면 생략.
+                reported_by:
+                  type: string
+                  enum: [host, guest, tenant]
+                  default: host
+      responses:
+        '201':
+          description: 접수됨
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Claim' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    get:
+      tags: [Claims]
+      summary: 발주 연관 보상·분쟁 조회
+      operationId: getOrderClaims
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  claims:
+                    type: array
+                    items: { $ref: '#/components/schemas/Claim' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ==================================================================
+  /sandbox/orders/{order_id}/transition:
+    parameters: [{ $ref: '#/components/parameters/OrderId' }]
+    post:
+      tags: [Sandbox]
+      summary: 발주 상태 강제 전이 (테스트 전용)
+      description: |
+        **테스트 키(`ck_test_...`)로만 호출 가능합니다.** 운영 키로 호출하면 403입니다.
+
+        실제 공급자 없이 상태를 진행시켜 연동 검증을 할 수 있습니다.
+        전이할 때마다 정상 경로와 동일하게 webhook이 발송됩니다.
+      operationId: sandboxTransition
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to_status]
+              properties:
+                to_status: { $ref: '#/components/schemas/OrderStatus' }
+                fault: { $ref: '#/components/schemas/FaultParty' }
+                failure_code: { type: string }
+                scheduled_at:
+                  type: string
+                  format: date-time
+                  description: |
+                    `scheduled_at` 을 임의 시각으로 설정합니다 (v0.3.1 추가).
+                    `free_change_until` 24시간 경계를 넘나드는 케이스
+                    (`dry_run` 의 `compensation_applies` 전환)를 검증할 때 사용하십시오.
+                    과거 시각도 허용됩니다.
+                completed_at:
+                  type: string
+                  format: date-time
+                  description: |
+                    `completed_at` 을 임의 시각으로 설정합니다.
+                    자동 확정 시한 검증용입니다.
+      responses:
+        '200':
+          description: 전이됨
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderDetail' }
+        '403':
+          description: 운영 키로는 호출할 수 없습니다
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+# ====================================================================
+webhooks:
+
+  orderStatusChanged:
+    post:
+      summary: 발주 상태 변경 통지
+      description: |
+        ### 서명 검증 (필수)
+        ```
+        X-Cleancall-Signature: sha256=<hex>
+        X-Cleancall-Timestamp: <unix seconds>
+        X-Cleancall-Delivery:  <uuid>
+        ```
+        `HMAC-SHA256(secret, "{timestamp}.{raw_body}")` 로 검증하십시오.
+        timestamp가 5분 이상 벌어지면 거부해야 합니다(replay 방지).
+
+        ### 순서 보장 (v0.2 추가)
+        재시도로 인해 **오래된 이벤트가 늦게 도착할 수 있습니다.**
+        - `sequence` — 발주별 단조 증가 정수. 이미 처리한 값보다 작으면 **무시하십시오.**
+        - `occurred_at` — 상태가 실제로 바뀐 시각 (`delivered_at`은 발송 시각)
+
+        `sequence`로 판정하는 것을 권장합니다. 동일 시각 문제가 없습니다.
+
+        ### 응답 규약
+        - **2xx를 빠르게 반환**하고 처리는 비동기로. 5초 초과 시 실패로 간주합니다.
+        - 4xx → 재시도 안 함 / 5xx·타임아웃 → 재시도
+        - 재시도: 1분 → 5분 → 15분 → 1시간 → 6시간 → 24시간 (최대 6회)
+
+        ### secret 로테이션
+        신규 secret 발급 시 **구 secret이 24시간 동안 동시 유효**합니다.
+        그 사이 양쪽 서명을 모두 허용하도록 구현하십시오.
+
+        ### webhook URL 등록·변경
+        운영 콘솔에서 설정합니다. URL·secret 모두 콘솔에서 관리하며,
+        변경 즉시 반영됩니다.
+
+        ⚠️ **webhook만 믿지 마십시오.** `GET /orders?updated_since=` 로 주기적 대조가 필요합니다.
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WebhookEvent' }
+      responses:
+        '200':
+          description: 수신 확인
+
+  propertyActivated:
+    post:
+      summary: 매물 활성화 통지
+      description: |
+        `pending_coverage` 상태였던 매물이 커버리지 확장으로 **발주 가능해졌을 때** 발송됩니다.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                event: { type: string, const: property.activated }
+                occurred_at: { type: string, format: date-time }
+                data: { $ref: '#/components/schemas/Property' }
+      responses:
+        '200':
+          description: 수신 확인
+
+# ====================================================================
+components:
+
+  securitySchemes:
+    apiKey:
+      type: http
+      scheme: bearer
+      description: |
+        `Authorization: Bearer ck_live_...` (운영)
+        `Authorization: Bearer ck_test_...` (테스트)
+
+        테스트 키는 별도 데이터 공간을 사용하며 실제 배차·청구가 발생하지 않습니다.
+        `/sandbox/*` 엔드포인트는 테스트 키로만 호출 가능합니다.
+
+        API 키는 **서버에서만** 사용하십시오. 유출 시 즉시 폐기·재발급하십시오.
+
+  parameters:
+    OrderId:
+      name: order_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    PropertyId:
+      name: property_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    Unauthorized:
+      description: API 키가 없거나 유효하지 않음
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: |
+        리소스를 찾을 수 없음.
+        타 테넌트 소유 리소스도 404를 반환합니다(존재 여부 비노출).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: 현재 상태에서 불가능한 요청
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ValidationFailed:
+      description: 입력값 오류
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+              examples:
+                - unauthorized
+                - property_not_found
+                - property_pending_coverage
+                - region_unresolved
+                - validation_failed
+                - invalid_state_transition
+                - rate_limited
+            message: { type: string }
+            details:
+              type: array
+              items: { type: string }
+
+    FaultParty:
+      type: string
+      description: |
+        귀책 주체. 보상 판단의 근거가 됩니다.
+
+        ### 판정 주체 (v0.3.1 명시)
+        테넌트가 `cancel` 등에 보내는 `fault`는 **참고 정보**입니다
+        (예: 게스트 사유임을 알려주는 용도).
+        **최종 판정은 클린콜이 발주 원장(SoR)을 근거로 수행**하며,
+        응답·webhook에 반환되는 `fault`가 확정값입니다.
+
+        테넌트 값과 판정이 다를 경우 클린콜 판정이 우선하되,
+        테넌트가 보낸 값은 원장에 함께 기록되어 분쟁 시 근거로 남습니다.
+      enum: [tenant, provider, host, guest, platform, none]
+
+    ActorType:
+      type: string
+      description: 상태를 변경한 주체 (v0.2 — enum 확정)
+      enum: [tenant, provider, host, operator, system]
+
+    OrderStatus:
+      type: string
+      enum:
+        - created
+        - billing_verified
+        - broadcasting
+        - accepted
+        - in_progress
+        - completed
+        - confirmed
+        - charged
+        - paid_out
+        - escalated
+        - reassigning
+        - backup_dispatch
+        - cancelled
+        - failed
+
+    TriggerType:
+      type: string
+      description: |
+        - `scheduled` — 정상 퇴실 청소
+        - `early_checkout` — 중도퇴실로 인한 긴급 청소
+        - `rework` — 청소 불량 재작업 (v0.2 추가)
+
+        멱등키가 `(tenant_ref, trigger_type)` 이므로 재청소는 별도 발주로 생성됩니다.
+      enum: [scheduled, early_checkout, rework]
+
+    # ---------------- Property ----------------
+    HostInput:
+      type: object
+      required: [tenant_host_ref]
+      description: |
+        `tenant_host_ref` + `display_name` 만으로 등록이 성립합니다.
+        `phone`/`email`은 **선택이며 미전송이 기본**입니다 — 개인정보 제3자 제공을
+        피하기 위해 클린콜이 호스트에게서 직접 수집합니다.
+      properties:
+        tenant_host_ref: { type: string }
+        display_name: { type: string }
+        phone:
+          type: string
+          description: 선택. 전송 시 개인정보 제3자 제공에 해당할 수 있습니다.
+        email:
+          type: string
+          format: email
+          description: 선택.
+
+    PropertyCreate:
+      type: object
+      required: [tenant_property_ref, address, host]
+      properties:
+        tenant_property_ref: { type: string }
+        name: { type: string }
+        address: { type: string }
+        address_detail:
+          type: string
+          description: 동·호수 등. 공급자에게는 **배차 확정 후에만** 노출됩니다.
+        region_code:
+          type: [string, 'null']
+          pattern: '^[0-9]{10}$'
+          description: |
+            법정동코드 10자리. **선택**(v0.2 변경).
+            없으면 `lat`/`lng` 또는 `address`로 서버가 해석하여 응답에 반환합니다.
+        lat:
+          type: number
+          description: |
+            위도. **좌표계는 WGS84**(카카오맵·구글맵 기준)입니다.
+            TM/KATEC 계열 좌표를 보내지 마십시오.
+            주소 문자열보다 정확하므로 있으면 함께 보내주십시오.
+        lng: { type: number }
+        size_pyeong: { type: number }
+        base_price:
+          type: integer
+          description: 기본 청소 단가(원). 생략 시 협의 단가 적용.
+        cleaning_deadline_hours:
+          type: integer
+          default: 24
+          description: |
+            `next_checkin_at`이 없을 때 적용할 마감 기한(시간).
+            마감 = `checkout_at` + 이 값.
+        spec:
+          type: object
+          additionalProperties: true
+          description: |
+            청소 규격(침구 수·화장실 수 등).
+            ⚠️ **출입 정보를 여기 넣지 마십시오.** 별도 경로로 호스트가 직접 등록합니다.
+        host: { $ref: '#/components/schemas/HostInput' }
+
+    PropertyUpdate:
+      type: object
+      properties:
+        name: { type: string }
+        address: { type: string }
+        address_detail: { type: string }
+        region_code: { type: [string, 'null'] }
+        lat: { type: number }
+        lng: { type: number }
+        size_pyeong: { type: number }
+        base_price: { type: integer }
+        cleaning_deadline_hours: { type: integer }
+        spec: { type: object, additionalProperties: true }
+        status: { type: string, enum: [active, inactive] }
+
+    Property:
+      type: object
+      properties:
+        property_id: { type: string, format: uuid }
+        tenant_property_ref: { type: string }
+        host_id: { type: string, format: uuid }
+        name: { type: string }
+        address: { type: string }
+        region_code:
+          type: [string, 'null']
+          description: 서버가 해석한 값. 저장해두고 다음부터 그대로 보내셔도 됩니다.
+        region_name: { type: [string, 'null'], examples: ['서울특별시 강남구 역삼동'] }
+        base_price: { type: [integer, 'null'] }
+        cleaning_deadline_hours: { type: integer }
+        status:
+          type: string
+          enum: [active, pending_coverage, inactive]
+          description: |
+            - `active` — 발주 가능
+            - `pending_coverage` — 등록됨. 서비스 지역 밖이라 발주 불가.
+              커버리지 확장 시 `property.activated` webhook 발송
+            - `inactive` — 비활성
+        created_at: { type: string, format: date-time }
+
+    PropertyDetail:
+      allOf:
+        - $ref: '#/components/schemas/Property'
+        - type: object
+          properties:
+            billing_status: { type: string, enum: [linked, not_linked] }
+            access_info:
+              type: object
+              description: |
+                매물 단위 출입 안내의 등록 상태 (v0.3 — 객체로 확장).
+                **값 자체는 어떤 경우에도 테넌트에게 반환되지 않습니다.**
+                `updated_at`은 개인정보가 아니며, 갱신 독려 판단에 사용하십시오.
+              properties:
+                status: { type: string, enum: [registered, not_registered] }
+                updated_at: { type: [string, 'null'], format: date-time }
+            setup_link_url:
+              type: [string, 'null']
+              format: uri
+              description: 미완료 항목이 있을 때 호스트에게 전달할 링크
+
+    PropertyCreated:
+      allOf: [{ $ref: '#/components/schemas/PropertyDetail' }]
+
+    # ---------------- Order ----------------
+    OrderCreate:
+      type: object
+      required: [tenant_ref, checkin_at, checkout_at]
+      properties:
+        tenant_ref:
+          type: string
+          description: |
+            테넌트측 예약 식별자. 멱등키이자 양방향 문의 대응의 기준입니다.
+            **반드시 저장해두십시오.**
+        property_ref: { type: string }
+        property_id: { type: string, format: uuid }
+        checkin_at:
+          type: string
+          format: date-time
+          description: 예약 체크인 시각
+        checkout_at:
+          type: string
+          format: date-time
+          description: |
+            예약 체크아웃 시각 = **청소 시작 가능 시각**.
+            `checkin_at` 보다 뒤여야 합니다.
+        next_checkin_at:
+          type: [string, 'null']
+          format: date-time
+          description: |
+            다음 예약의 체크인 시각 = 청소 마감 기한.
+            **선택 힌트**입니다. 없으면 `checkout_at + cleaning_deadline_hours`가 적용됩니다.
+            나중에 확정되면 `PATCH /orders/{id}`로 채워주십시오.
+        trigger_type: { $ref: '#/components/schemas/TriggerType' }
+        priority: { type: string, enum: [normal, urgent], default: normal }
+        spec: { type: object, additionalProperties: true }
+        base_amount: { type: integer }
+
+    OrderUpdate:
+      type: object
+      properties:
+        checkout_at: { type: string, format: date-time }
+        next_checkin_at: { type: [string, 'null'], format: date-time }
+        spec: { type: object, additionalProperties: true }
+        dry_run:
+          type: boolean
+          default: false
+          description: |
+            true면 **실제 변경 없이** 보상 발생 여부·예상 금액만 반환합니다 (v0.3 추가).
+            호스트에게 사전 안내한 뒤 실제 호출하십시오.
+
+    ChangePreview:
+      type: object
+      description: 변경·취소 시 보상 발생 여부 (v0.3 추가)
+      properties:
+        compensation_applies: { type: boolean }
+        estimated_amount:
+          type: integer
+          description: 예상 취소보상액(원). 미발생 시 0.
+        free_until:
+          type: [string, 'null']
+          format: date-time
+          description: 이 시각까지는 무보상. 배차 전이면 null(언제든 무보상).
+        fault: { $ref: '#/components/schemas/FaultParty' }
+
+    Order:
+      type: object
+      properties:
+        order_id: { type: string, format: uuid }
+        tenant_ref: { type: string }
+        property_id: { type: string, format: uuid }
+        status: { $ref: '#/components/schemas/OrderStatus' }
+        trigger_type: { $ref: '#/components/schemas/TriggerType' }
+        priority: { type: string, enum: [normal, urgent] }
+        checkin_at: { type: string, format: date-time }
+        checkout_at: { type: string, format: date-time }
+        next_checkin_at: { type: [string, 'null'], format: date-time }
+        deadline_at:
+          type: string
+          format: date-time
+          description: |
+            서버가 계산한 최종 청소 마감 기한 (v0.2 추가).
+            `next_checkin_at` 또는 `checkout_at + cleaning_deadline_hours`.
+        scheduled_at:
+          type: [string, 'null']
+          format: date-time
+          description: |
+            **배차 확정된 청소 예정 시각** (v0.2 추가).
+            `accepted` 전이 시 확정됩니다. 호스트 화면의 "언제 청소하러 오는지"가 이 값입니다.
+        arrival_at:
+          type: [string, 'null']
+          format: date-time
+          description: 공급자 실제 도착 시각 (`in_progress` 전이 시 기록)
+        charge_amount: { type: integer }
+        charged_at: { type: [string, 'null'], format: date-time }
+        fault: { $ref: '#/components/schemas/FaultParty' }
+        free_change_until:
+          type: [string, 'null']
+          format: date-time
+          description: |
+            **무보상 변경·취소 가능 시한**.
+            호스트 화면에 "N월 N일까지 무료 변경"으로 표시하십시오.
+
+            - 배차 전(`created`·`billing_verified`·`broadcasting`)에는 **`null`이며
+              언제든 무보상**입니다.
+            - 배차 후에는 `scheduled_at - 24시간`입니다.
+
+            ### 불리한 소급 없음 (v0.3.1)
+            **공급자 사유로 `scheduled_at`이 앞당겨져도 이 값은 줄어들지 않습니다.**
+            ```
+            free_change_until = max( 기존 값, 새 scheduled_at - 24h )
+            ```
+            호스트가 아무것도 하지 않았는데 보상 대상 구간에 들어가는 일은
+            발생하지 않습니다. 테넌트가 이미 안내한 시한은 그대로 유효합니다.
+
+            반대로 뒤로 미뤄지는 경우는 호스트에게 유리하므로 그대로 갱신됩니다.
+            테넌트 요청으로 일정이 변경된 경우에는 새 `scheduled_at` 기준으로
+            재계산됩니다.
+        access_info:
+          type: object
+          description: |
+            이 발주에 적용될 출입 정보의 상태 (v0.3 추가). **값은 반환되지 않습니다.**
+          properties:
+            status: { type: string, enum: [registered, not_registered, stale] }
+            updated_at: { type: [string, 'null'], format: date-time }
+        sequence:
+          type: integer
+          description: 발주별 단조 증가. webhook 순서 판정과 동일한 값입니다.
+        updated_at: { type: string, format: date-time }
+
+    OrderCreated:
+      allOf:
+        - $ref: '#/components/schemas/Order'
+        - type: object
+          properties:
+            billing_verified: { type: boolean }
+            idempotent_replay: { type: boolean }
+            warnings:
+              type: array
+              description: |
+                배차 보류·주의 사유들.
+                `access_info_stale`은 보류가 아니라 **경고**입니다 — 배차는 진행되지만
+                공급자가 문 앞에서 못 들어갈 위험이 있습니다. 호스트에게 갱신을
+                안내해 주십시오.
+              items:
+                type: object
+                properties:
+                  code:
+                    type: string
+                    enum:
+                      - billing_key_required
+                      - access_info_required
+                      - access_info_stale
+                  message: { type: string }
+                  next_action: { type: string }
+            access_update_url:
+              type: [string, 'null']
+              format: uri
+              description: |
+                **이 발주 건에만 적용되는 출입 정보(도어락 비밀번호) 갱신 링크** (v0.3 추가).
+                호스트에게 전달하십시오 — 체크아웃 안내에 끼워 보내는 것을 권장합니다.
+                입력 항목이 하나뿐이라 호스트 부담이 작습니다.
+                링크는 해당 발주의 청소 완료 시점까지 유효합니다.
+
+    OrderDetail:
+      allOf:
+        - $ref: '#/components/schemas/Order'
+        - type: object
+          properties:
+            provider:
+              type: [object, 'null']
+              description: |
+                배차된 공급자. **최소 정보만 제공됩니다.**
+                연락이 필요하면 `POST /orders/{id}/messages`를 사용하십시오.
+              properties:
+                display_name: { type: string }
+                type: { type: string, enum: [business, individual] }
+            amounts:
+              type: object
+              properties:
+                base_amount: { type: integer }
+                urgent_premium:
+                  type: integer
+                  description: '**현재 항상 0입니다.** info의 x-pricing-policy 참조.'
+                charge_amount: { type: integer }
+            completion:
+              type: [object, 'null']
+              properties:
+                photos:
+                  type: array
+                  items: { type: string, format: uri }
+                checklist: { type: object, additionalProperties: true }
+                completed_at: { type: string, format: date-time }
+            tax_invoice:
+              type: [object, 'null']
+              description: 클린콜 → 호스트 발행 세금계산서 (v0.2 추가)
+              properties:
+                status: { type: string, enum: [pending, issued, failed] }
+                issued_at: { type: [string, 'null'], format: date-time }
+                url: { type: [string, 'null'], format: uri }
+            access_update_url:
+              type: [string, 'null']
+              format: uri
+              description: |
+                발주 단위 출입 정보 갱신 링크 (v0.3.1 — 상세 조회에도 포함).
+                발주 생성과 청소 시점 사이가 길어 재조회가 필요한 경우를 위한 것입니다.
+                링크 자체는 민감정보가 아니며(입력 페이지),
+                해당 발주의 청소 완료 시점까지 유효합니다.
+            failure_code:
+              type: [string, 'null']
+              description: 실패 사유 코드 (v0.2 추가)
+              examples: [no_provider_available, payment_declined, provider_noshow]
+            failure_reason: { type: [string, 'null'] }
+            cancel_reason: { type: [string, 'null'] }
+            events:
+              type: array
+              description: 상태 전이 이력 (append-only)
+              items:
+                type: object
+                properties:
+                  sequence: { type: integer }
+                  to_status: { $ref: '#/components/schemas/OrderStatus' }
+                  actor_type: { $ref: '#/components/schemas/ActorType' }
+                  reason: { type: [string, 'null'] }
+                  at: { type: string, format: date-time }
+
+    Claim:
+      type: object
+      description: |
+        보상·분쟁 건.
+
+        **승인된 보상금은 클린콜이 호스트에게 직접 지급합니다.**
+        테넌트는 자금 흐름에 관여하지 않습니다.
+
+        접수 기한은 완료 보고(`completed`) 후 **7일**입니다.
+        `confirmed`·`charged` 이후에도 접수 가능합니다.
+      properties:
+        claim_id: { type: string, format: uuid }
+        order_id: { type: string, format: uuid }
+        type:
+          type: string
+          enum: [cleaning_defect, dispatch_failure, property_damage, urgent_premium, other]
+        status:
+          type: string
+          enum: [open, investigating, approved, rejected, closed]
+        fault: { $ref: '#/components/schemas/FaultParty' }
+        claimed_amount: { type: [integer, 'null'] }
+        approved_amount: { type: [integer, 'null'] }
+        opened_at: { type: string, format: date-time }
+        resolved_at: { type: [string, 'null'], format: date-time }
+
+    WebhookEvent:
+      type: object
+      required: [event, sequence, occurred_at, data]
+      properties:
+        event:
+          type: string
+          description: |
+            `order.paid_out`은 발송하지 않습니다.
+            `order.dispatch_unblocked`는 v0.2의 `order.billing_verified`를 개명한 것입니다 —
+            결제수단·출입정보 **어느 사유로 보류됐든 해제 시 이 이벤트**가 발송됩니다.
+          enum:
+            - order.dispatch_unblocked
+            - order.rescheduled
+            - order.access_info_stale
+            - order.dispatched
+            - order.in_progress
+            - order.completed
+            - order.confirmed
+            - order.charged
+            - order.cancelled
+            - order.failed
+            - order.urgent_created
+            - claim.updated
+        sequence:
+          type: integer
+          description: |
+            발주별 단조 증가 정수 (v0.2 추가).
+            **이미 처리한 값보다 작거나 같으면 무시하십시오.**
+        occurred_at:
+          type: string
+          format: date-time
+          description: 상태가 실제로 바뀐 시각 (v0.2 추가)
+        delivered_at:
+          type: string
+          format: date-time
+          description: 이 요청의 발송 시각. 재시도 시 갱신됩니다.
+        stage:
+          type: [string, 'null']
+          description: '`order.failed` 세부 단계'
+          enum: [escalated, reassigning, final, null]
+        data:
+          oneOf:
+            - $ref: '#/components/schemas/OrderDetail'
+            - $ref: '#/components/schemas/Claim'
