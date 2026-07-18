@@ -10,7 +10,7 @@ export default function Hero() {
           className="w-full h-full object-cover object-top"
         />
         {/* Dark gradient overlay for text readability */}
-        <div className="absolute inset-0 bg-gradient-to-b from-black/55 via-black/40 to-black/60" />
+        <div className="absolute inset-0 bg-linear-to-b from-black/55 via-black/40 to-black/60" />
       </div>
 
       {/* Content */}
@@ -18,7 +18,7 @@ export default function Hero() {
         <div className="grid grid-cols-1 md:grid-cols-12 gap-10 items-center">
           {/* Left - Text content */}
           <div className="md:col-span-7">
-            <span className="inline-block px-3 py-1 text-xs font-medium bg-white/15 text-white border border-white/20 rounded-full whitespace-nowrap backdrop-blur-sm">
+            <span className="inline-block px-3 py-1 text-xs font-medium bg-white/15 text-white border border-white/20 rounded-full whitespace-nowrap backdrop-blur-xs">
               STR 턴오버 청소 자동화
             </span>
 
@@ -41,7 +41,7 @@ export default function Hero() {
               </button>
               <button
                 type="button"
-                className="py-2.5 px-5 text-sm font-medium bg-white/10 text-white border border-white/25 rounded-md hover:bg-white/20 hover:border-white/40 transition-colors duration-200 whitespace-nowrap cursor-pointer backdrop-blur-sm"
+                className="py-2.5 px-5 text-sm font-medium bg-white/10 text-white border border-white/25 rounded-md hover:bg-white/20 hover:border-white/40 transition-colors duration-200 whitespace-nowrap cursor-pointer backdrop-blur-xs"
                 onClick={() => { /* TODO: 청소 공급자로 가입 */ }}
               >
                 청소 공급자로 가입

@@ -26,7 +26,7 @@ export default function CTABand() {
             </div>
             <button
               type="button"
-              className="py-2.5 px-5 text-sm font-medium bg-white text-foreground-950 rounded-md hover:bg-background-100 transition-colors duration-200 whitespace-nowrap cursor-pointer flex-shrink-0"
+              className="py-2.5 px-5 text-sm font-medium bg-white text-foreground-950 rounded-md hover:bg-background-100 transition-colors duration-200 whitespace-nowrap cursor-pointer shrink-0"
               onClick={() => { /* TODO: 도입 문의하기 */ }}
             >
               도입 문의하기

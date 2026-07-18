@@ -1,5 +1,6 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
 import { resolve } from "node:path";
 
 const base = process.env.BASE_PATH || "/";
@@ -14,7 +15,7 @@ export default defineConfig({
     __READDY_VERSION_ID__: JSON.stringify(process.env.VERSION_ID || ""),
     __READDY_AI_DOMAIN__: JSON.stringify(process.env.READDY_AI_DOMAIN || ""),
   },
-  plugins: [react()],
+  plugins: [react(), tailwindcss()],
   base,
   build: {
     sourcemap: true,

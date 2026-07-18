@@ -38,9 +38,9 @@ export default function HowItWorks() {
         {/* Steps grid - 2 columns on desktop */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
           {steps.map((step, i) => (
-            <div key={step.num} className="flex gap-4 bg-background-50 rounded-lg p-4 items-start hover:shadow-sm transition-shadow duration-300 cursor-pointer group">
+            <div key={step.num} className="flex gap-4 bg-background-50 rounded-lg p-4 items-start hover:shadow-xs transition-shadow duration-300 cursor-pointer group">
               {/* Step image */}
-              <div className="w-[140px] h-[100px] flex-shrink-0 rounded-md overflow-hidden">
+              <div className="w-[140px] h-[100px] shrink-0 rounded-md overflow-hidden">
                 <img
                   src={step.image}
                   alt={step.title}
@@ -57,7 +57,7 @@ export default function HowItWorks() {
               </div>
               {/* Arrow for desktop */}
               {i < steps.length - 1 && (
-                <div className="hidden md:flex w-6 h-6 items-center justify-center text-foreground-300 flex-shrink-0 self-center">
+                <div className="hidden md:flex w-6 h-6 items-center justify-center text-foreground-300 shrink-0 self-center">
                   <i className="ri-arrow-down-s-line text-lg" />
                 </div>
               )}

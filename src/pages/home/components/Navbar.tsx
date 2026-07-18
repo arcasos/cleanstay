@@ -15,7 +15,7 @@ export default function Navbar() {
     <nav
       className={`sticky top-0 z-50 h-14 flex items-center transition-all duration-300 ${
         scrolled
-          ? 'bg-white/90 backdrop-blur border-b border-background-200 shadow-sm'
+          ? 'bg-white/90 backdrop-blur-sm border-b border-background-200 shadow-xs'
           : 'bg-transparent'
       }`}
     >
@@ -59,7 +59,7 @@ export default function Navbar() {
             className={`py-1.5 px-3 text-xs rounded-md transition-all duration-200 whitespace-nowrap cursor-pointer ${
               scrolled
                 ? 'bg-primary-500 text-white hover:bg-primary-600'
-                : 'bg-white/15 text-white border border-white/25 hover:bg-white/25 backdrop-blur-sm'
+                : 'bg-white/15 text-white border border-white/25 hover:bg-white/25 backdrop-blur-xs'
             }`}
             onClick={() => { /* TODO: 도입 문의 */ }}
           >
