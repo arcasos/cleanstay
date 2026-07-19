@@ -215,6 +215,13 @@ Deno.serve(async (req) => {
     if (s.claimed === 0) break;
   }
 
+  // 하트비트. pg_net 은 fire-and-forget 이라 cron 쪽에서는 호출 실패가 묻힌다.
+  // 워커가 실제로 돌았다는 증거는 여기밖에 없다. check_webhook_pipeline() 이 읽는다.
+  const { error: hbErr } = await db.rpc("record_webhook_worker_run", {
+    p_summary: total,
+  });
+  if (hbErr) console.error(`하트비트 기록 실패: ${JSON.stringify(hbErr)}`);
+
   return new Response(JSON.stringify(total), {
     status: 200,
     headers: { "Content-Type": "application/json" },
