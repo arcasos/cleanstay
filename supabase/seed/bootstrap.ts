@@ -235,25 +235,34 @@ async function seedApiKeys(
   return out;
 }
 
-async function seedHost(sb: SupabaseClient, tenantId: string): Promise<string> {
+/**
+ * 호스트는 env별로 별개 행이다. 자연키가 (tenant_id, tenant_host_ref, env)이고
+ * `env`에는 DEFAULT가 없다 — 빠뜨리면 not-null 위반으로 즉시 실패한다.
+ */
+async function seedHost(
+  sb: SupabaseClient,
+  tenantId: string,
+  env: Env,
+): Promise<string> {
   const existing = must<TenantRow>(
     await sb.from("hosts").select("id")
       .eq("tenant_id", tenantId)
       .eq("tenant_host_ref", HOST.tenant_host_ref)
+      .eq("env", env)
       .maybeSingle(),
     "호스트 조회",
   );
   if (existing) {
-    log(`  호스트      기존 사용  ${HOST.tenant_host_ref} (${existing.id})`);
+    log(`  호스트      기존 사용  ${HOST.tenant_host_ref} [${env}] (${existing.id})`);
     return existing.id;
   }
   // phone/email은 선택 필드이며 미전송이 기본이다(개인정보 제3자 제공 회피).
   const created = mustRow<IdRow>(
-    await sb.from("hosts").insert({ tenant_id: tenantId, ...HOST })
+    await sb.from("hosts").insert({ tenant_id: tenantId, env, ...HOST })
       .select("id").single(),
     "호스트 생성",
   );
-  log(`  호스트      생성       ${HOST.tenant_host_ref} (${created.id})`);
+  log(`  호스트      생성       ${HOST.tenant_host_ref} [${env}] (${created.id})`);
   return created.id;
 }
 
@@ -284,34 +293,37 @@ async function seedProperties(
   sb: SupabaseClient,
   tenantId: string,
   hostId: string,
+  env: Env,
 ): Promise<void> {
   for (const p of PROPERTIES) {
     const existing = must<PropertyRow>(
       await sb.from("properties").select("id, status")
         .eq("tenant_id", tenantId)
         .eq("tenant_property_ref", p.tenant_property_ref)
+        .eq("env", env)
         .maybeSingle(),
       "매물 조회",
     );
     if (existing) {
       log(
-        `  매물        기존 사용  ${p.tenant_property_ref} ` +
+        `  매물        기존 사용  ${p.tenant_property_ref} [${env}] ` +
           `(${existing.id}, ${existing.status})`,
       );
       continue;
     }
-    // env는 컬럼 DEFAULT가 'live'지만 의존하지 않고 명시한다.
+    // env에는 DEFAULT가 없다. 빠뜨리면 not-null 위반으로 즉시 실패한다.
+    // host_id도 같은 env의 호스트여야 한다 — 복합 FK가 강제한다.
     const created = mustRow<IdRow>(
       await sb.from("properties").insert({
         tenant_id: tenantId,
         host_id: hostId,
-        env: "live",
+        env,
         ...p,
       }).select("id").single(),
       "매물 생성",
     );
     log(
-      `  매물        생성       ${p.tenant_property_ref} ` +
+      `  매물        생성       ${p.tenant_property_ref} [${env}] ` +
         `(${created.id}, ${p.status})`,
     );
   }
@@ -326,9 +338,16 @@ async function main() {
   if (ROTATE) log("  [--rotate] 기존 API 키를 폐기하고 재발급한다.\n");
 
   const tenantId = await seedTenant(sb);
-  const hostId = await seedHost(sb, tenantId);
   await seedCoverage(sb);
-  await seedProperties(sb, tenantId, hostId);
+
+  // live·test 양쪽에 호스트와 매물을 만든다.
+  // 검증은 test 키로만 하므로(CLAUDE.md §6.6) test env에도 데이터가 있어야 한다.
+  // 호스트·매물·발주는 env별로 완전히 분리된 행이며, 복합 FK가 교차 참조를 막는다.
+  for (const env of ["live", "test"] as Env[]) {
+    const hostId = await seedHost(sb, tenantId, env);
+    await seedProperties(sb, tenantId, hostId, env);
+  }
+
   const keys = await seedApiKeys(sb, tenantId);
 
   log("\n=== API 키 ===\n");

@@ -174,17 +174,23 @@ const PROPERTY_COLS =
 async function upsertHost(
   db: SupabaseClient,
   tenantId: string,
+  env: string,
   host: HostInput,
 ): Promise<string | null> {
   const ref = host.tenant_host_ref as string;
 
+  // env로도 걸러야 한다. 호스트는 env별로 별개 행이며, 자연키는
+  // (tenant_id, tenant_host_ref, env)다.
   const { data: found } = await db.from("hosts").select("id")
-    .eq("tenant_id", tenantId).eq("tenant_host_ref", ref).maybeSingle();
+    .eq("tenant_id", tenantId).eq("tenant_host_ref", ref)
+    .eq("env", env).maybeSingle();
   if (found) return (found as { id: string }).id;
 
   const insert: Record<string, unknown> = {
     tenant_id: tenantId,
     tenant_host_ref: ref,
+    // env는 DEFAULT가 없다. 빠뜨리면 not-null 위반으로 즉시 실패한다.
+    env,
   };
   if (isStr(host.display_name)) insert.display_name = host.display_name;
   if (isStr(host.phone)) insert.phone = host.phone;
@@ -196,7 +202,8 @@ async function upsertHost(
   if (error) {
     // 동시 요청이 같은 호스트를 만들면 unique 위반(23505)이 난다. 재조회로 수렴시킨다.
     const { data: raced } = await db.from("hosts").select("id")
-      .eq("tenant_id", tenantId).eq("tenant_host_ref", ref).maybeSingle();
+      .eq("tenant_id", tenantId).eq("tenant_host_ref", ref)
+      .eq("env", env).maybeSingle();
     return raced ? (raced as { id: string }).id : null;
   }
   return (data as { id: string }).id;
@@ -263,7 +270,12 @@ async function createProperty(
     return errorResponse(req, "region_unresolved", { details: [detail] });
   }
 
-  const hostId = await upsertHost(db, ctx.tenantId, body.host as HostInput);
+  const hostId = await upsertHost(
+    db,
+    ctx.tenantId,
+    ctx.env,
+    body.host as HostInput,
+  );
   if (!hostId) return errorResponse(req, "db_error");
 
   const insert: Record<string, unknown> = {
