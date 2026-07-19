@@ -19,6 +19,27 @@ import type { SupabaseClient } from "jsr:@supabase/supabase-js@2";
 const TRIGGER_TYPES = ["scheduled", "early_checkout", "rework"] as const;
 const PRIORITIES = ["normal", "urgent"] as const;
 
+/** 목록 필터용. 전이는 이 함수의 책임이 아니므로 값 검증에만 쓴다. */
+const ORDER_STATUSES: string[] = [
+  "created",
+  "billing_verified",
+  "broadcasting",
+  "accepted",
+  "in_progress",
+  "completed",
+  "confirmed",
+  "charged",
+  "paid_out",
+  "escalated",
+  "reassigning",
+  "backup_dispatch",
+  "cancelled",
+  "failed",
+];
+
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 type TriggerType = typeof TRIGGER_TYPES[number];
 
 interface OrderCreateBody {
@@ -61,6 +82,7 @@ interface OrderRow {
   tenant_ref: string;
   property_id: string;
   host_id: string;
+  provider_id: string | null;
   status: string;
   trigger_type: string;
   priority: string;
@@ -81,7 +103,7 @@ interface OrderRow {
 }
 
 const ORDER_COLS =
-  "id, tenant_ref, property_id, host_id, status, trigger_type, priority, " +
+  "id, tenant_ref, property_id, host_id, provider_id, status, trigger_type, priority, " +
   "checkin_at, checkout_at, next_checkin_at, deadline_at, scheduled_at, arrival_at, " +
   "base_amount, urgent_premium, charge_amount, charged_at, fault, free_change_until, " +
   "sequence, updated_at";
@@ -406,6 +428,246 @@ async function appendEvent(
 }
 
 // ---------------------------------------------------------------------------
+// 조회 — reconciliation
+// ---------------------------------------------------------------------------
+
+const LIST_LIMIT_DEFAULT = 50;
+const LIST_LIMIT_MAX = 200;
+
+/**
+ * 커서 = (updated_at, order_id) 복합 키를 base64url 로 인코딩한 것.
+ *
+ * 단일 컬럼(updated_at)만으로는 커서가 성립하지 않는다. 같은 시각에 여러 건이
+ * 갱신되면 경계에서 건너뛰거나 무한 반복한다. order_id 를 tie-breaker 로 붙인다.
+ */
+function encodeCursor(updatedAt: string, id: string): string {
+  return btoa(`${updatedAt}|${id}`).replace(/\+/g, "-").replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+function decodeCursor(c: string): { updatedAt: string; id: string } | null {
+  try {
+    const padded = c.replace(/-/g, "+").replace(/_/g, "/");
+    const raw = atob(padded + "=".repeat((4 - padded.length % 4) % 4));
+    const i = raw.lastIndexOf("|");
+    if (i < 0) return null;
+    const updatedAt = raw.slice(0, i);
+    const id = raw.slice(i + 1);
+    if (!updatedAt || !UUID_PATTERN.test(id)) return null;
+    if (Number.isNaN(new Date(updatedAt).getTime())) return null;
+    return { updatedAt, id };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * GET /v1/orders — webhook 유실 대비 대조용 목록.
+ *
+ * `updated_since` 는 **`>=`** 로 동작한다. 경계 건이 중복 수신될 수 있으나
+ * 누락되지 않는다. 대사(reconciliation)에서 중복은 무해하고 누락은 치명적이다.
+ */
+async function listOrders(
+  req: Request,
+  db: SupabaseClient,
+  ctx: TenantContext,
+): Promise<Response> {
+  const url = new URL(req.url);
+  const details: string[] = [];
+
+  const rawLimit = url.searchParams.get("limit");
+  let limit = LIST_LIMIT_DEFAULT;
+  if (rawLimit !== null) {
+    const n = Number(rawLimit);
+    if (!Number.isInteger(n) || n < 1 || n > LIST_LIMIT_MAX) {
+      details.push(`limit은 1~${LIST_LIMIT_MAX} 사이 정수여야 합니다.`);
+    } else limit = n;
+  }
+
+  const updatedSince = url.searchParams.get("updated_since");
+  if (updatedSince !== null && !parseTs(updatedSince)) {
+    details.push("updated_since는 ISO8601 시각이어야 합니다.");
+  }
+
+  const status = url.searchParams.get("status");
+  if (status !== null && !ORDER_STATUSES.includes(status)) {
+    details.push(`status는 ${ORDER_STATUSES.join(" | ")} 중 하나여야 합니다.`);
+  }
+
+  const rawCursor = url.searchParams.get("cursor");
+  const cursor = rawCursor ? decodeCursor(rawCursor) : null;
+  if (rawCursor && !cursor) details.push("cursor가 올바르지 않습니다.");
+
+  if (details.length > 0) {
+    return errorResponse(req, "validation_failed", { details });
+  }
+
+  // env 필터를 빠뜨리면 test 키가 live 발주를 읽어간다. 같은 유형의 버그가
+  // 세 번 나왔다 — 조회는 복합 FK로도 막히지 않으므로 여기서 반드시 건다.
+  let q = db.from("orders").select(ORDER_COLS)
+    .eq("tenant_id", ctx.tenantId)
+    .eq("env", ctx.env);
+
+  if (updatedSince) q = q.gte("updated_at", updatedSince);
+  if (status) q = q.eq("status", status);
+  if (cursor) {
+    // (updated_at, id) > (cursor.updatedAt, cursor.id) 의 키셋 비교.
+    // PostgREST 는 행 값 비교를 직접 지원하지 않아 or/and 로 편다.
+    q = q.or(
+      `updated_at.gt.${cursor.updatedAt},` +
+        `and(updated_at.eq.${cursor.updatedAt},id.gt.${cursor.id})`,
+    );
+  }
+
+  // 한 건 더 읽어 다음 페이지 존재 여부를 판정한다.
+  const { data, error } = await q
+    .order("updated_at", { ascending: true })
+    .order("id", { ascending: true })
+    .limit(limit + 1);
+
+  if (error) {
+    console.error(`발주 목록 조회 실패: ${JSON.stringify(error)}`);
+    return errorResponse(req, "db_error");
+  }
+
+  const rows = (data ?? []) as unknown as OrderRow[];
+  const hasMore = rows.length > limit;
+  const page = hasMore ? rows.slice(0, limit) : rows;
+
+  const gatesList = await Promise.all(
+    page.map((o) => checkGates(db, o.host_id, o.property_id)),
+  );
+
+  return jsonResponse(req, 200, {
+    orders: page.map((o, i) => toOrder(o, gatesList[i])),
+    // 마지막 페이지면 null. 클라이언트는 이걸로 종료를 판정한다.
+    next_cursor: hasMore
+      ? encodeCursor(page[page.length - 1].updated_at, page[page.length - 1].id)
+      : null,
+  });
+}
+
+/** OrderDetail 조립. 목록용 Order 에 상세 필드를 더한다. */
+async function toOrderDetail(
+  db: SupabaseClient,
+  row: OrderRow,
+  opts: { withAccessUrl: boolean },
+): Promise<Record<string, unknown>> {
+  const [gates, providerRes, eventsRes, extraRes] = await Promise.all([
+    checkGates(db, row.host_id, row.property_id),
+    row.provider_id
+      ? db.from("providers").select("display_name, type").eq("id", row.provider_id)
+        .maybeSingle()
+      : Promise.resolve({ data: null }),
+    db.from("order_events").select("sequence, to_status, actor, reason, at")
+      .eq("order_id", row.id).order("id", { ascending: true }),
+    db.from("orders")
+      .select("completion_photos, checklist, completed_at, failure_code, failure_reason, cancel_reason")
+      .eq("id", row.id).maybeSingle(),
+  ]);
+
+  const provider = providerRes.data as
+    | { display_name: string; type: string }
+    | null;
+  const extra = extraRes.data as {
+    completion_photos: unknown[];
+    checklist: Record<string, unknown>;
+    completed_at: string | null;
+    failure_code: string | null;
+    failure_reason: string | null;
+    cancel_reason: string | null;
+  } | null;
+
+  // 출입정보 갱신 링크는 평문을 저장하지 않으므로 기존 링크를 복원할 수 없다.
+  // 단건 조회에서만 새로 발급한다. 스펙상 링크 자체는 민감정보가 아니며
+  // (입력 페이지) 이전 링크도 만료 전까지 함께 유효하다.
+  let accessUrl: string | null = null;
+  if (opts.withAccessUrl && row.deadline_at) {
+    const t = await issueOrderAccessToken(db, {
+      orderId: row.id,
+      hostId: row.host_id,
+      deadlineAt: row.deadline_at,
+    });
+    accessUrl = t?.url ?? null;
+  }
+
+  return {
+    ...toOrder(row, gates),
+    provider: provider
+      ? { display_name: provider.display_name, type: provider.type }
+      : null,
+    amounts: {
+      base_amount: row.base_amount,
+      urgent_premium: row.urgent_premium,
+      charge_amount: row.charge_amount,
+    },
+    completion: extra?.completed_at
+      ? {
+        photos: extra.completion_photos ?? [],
+        checklist: extra.checklist ?? {},
+        completed_at: extra.completed_at,
+      }
+      : null,
+    // 세금계산서 발행 EF가 아직 없다. 필드 자리만 유지한다.
+    tax_invoice: null,
+    access_update_url: accessUrl,
+    failure_code: extra?.failure_code ?? null,
+    failure_reason: extra?.failure_reason ?? null,
+    cancel_reason: extra?.cancel_reason ?? null,
+    events: eventsRes.data ?? [],
+  };
+}
+
+async function getOrder(
+  req: Request,
+  db: SupabaseClient,
+  ctx: TenantContext,
+  orderId: string,
+): Promise<Response> {
+  const { data } = await db.from("orders").select(ORDER_COLS)
+    .eq("id", orderId)
+    .eq("tenant_id", ctx.tenantId)
+    .eq("env", ctx.env)
+    .maybeSingle();
+  if (!data) return errorResponse(req, "order_not_found");
+
+  return jsonResponse(
+    req,
+    200,
+    await toOrderDetail(db, data as unknown as OrderRow, { withAccessUrl: true }),
+  );
+}
+
+/**
+ * GET /v1/orders/by-ref/{tenant_ref}
+ *
+ * 한 예약에 복수 발주가 있을 수 있다 — 중도퇴실 긴급 발주, 재청소(rework).
+ * 멱등키가 `(tenant_id, tenant_ref, trigger_type, env)` 이므로 `tenant_ref`
+ * 하나로는 유일하지 않다. 배열로 돌려준다.
+ */
+async function getOrdersByRef(
+  req: Request,
+  db: SupabaseClient,
+  ctx: TenantContext,
+  tenantRef: string,
+): Promise<Response> {
+  const { data } = await db.from("orders").select(ORDER_COLS)
+    .eq("tenant_id", ctx.tenantId)
+    .eq("tenant_ref", tenantRef)
+    .eq("env", ctx.env)
+    .order("created_at", { ascending: true });
+
+  const rows = (data ?? []) as unknown as OrderRow[];
+  if (rows.length === 0) return errorResponse(req, "order_not_found");
+
+  const orders = [];
+  for (const r of rows) {
+    orders.push(await toOrderDetail(db, r, { withAccessUrl: false }));
+  }
+  return jsonResponse(req, 200, { orders });
+}
+
+// ---------------------------------------------------------------------------
 
 Deno.serve(async (req) => {
   const pre = handlePreflight(req);
@@ -421,8 +683,22 @@ Deno.serve(async (req) => {
     .replace(/^\/v1/, "")
     .replace(/\/+$/, "");
 
-  if (req.method === "POST" && (path === "/orders" || path === "")) {
-    return await createOrder(req, db, ctx);
+  if (path === "/orders" || path === "") {
+    if (req.method === "POST") return await createOrder(req, db, ctx);
+    if (req.method === "GET") return await listOrders(req, db, ctx);
+  }
+
+  // by-ref 를 {order_id} 보다 먼저 본다. 아래 패턴이 "by-ref" 를
+  // order_id 로 삼키지 않도록.
+  const byRef = path.match(/^\/orders\/by-ref\/(.+)$/);
+  if (req.method === "GET" && byRef) {
+    return await getOrdersByRef(req, db, ctx, decodeURIComponent(byRef[1]));
+  }
+
+  const one = path.match(/^\/orders\/([^/]+)$/);
+  if (req.method === "GET" && one) {
+    if (!UUID_PATTERN.test(one[1])) return errorResponse(req, "order_not_found");
+    return await getOrder(req, db, ctx, one[1]);
   }
 
   return errorResponse(req, "order_not_found", {
