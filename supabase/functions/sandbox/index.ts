@@ -55,7 +55,6 @@ const STATUS_TIMESTAMP: Partial<Record<OrderStatus, string>> = {
   cancelled: "cancelled_at",
 };
 
-const FREE_CHANGE_LEAD_MS = 24 * 60 * 60 * 1000;
 const AUTO_CONFIRM_MIN_MS = 6 * 60 * 60 * 1000;
 
 interface TransitionBody {
@@ -139,21 +138,23 @@ function validate(body: TransitionBody): string[] {
 /**
  * 무보상 변경·취소 시한.
  *
- * 배차 전에는 null이며 언제든 무보상이다. 배차 후에는 scheduled_at - 24h 다.
- *
- * ⚠️ 불리한 소급 없음(v0.3.1) — 기존 값보다 앞당겨지지 않는다.
- *    호스트가 아무것도 하지 않았는데 보상 대상 구간에 들어가는 일은 없어야 한다.
- *    뒤로 미뤄지는 경우는 호스트에게 유리하므로 그대로 갱신한다.
+ * 규칙(리드타임 24h, 불리한 소급 금지)은 DB의 `compute_free_change_until()` 하나에
+ * 있다. §13 #13 이 제안값이라 바뀔 수 있으므로 상수를 EF에 흩뿌리지 않는다.
  */
-function nextFreeChangeUntil(
+async function nextFreeChangeUntil(
+  db: SupabaseClient,
   current: string | null,
   scheduledAt: Date,
-): string {
-  const candidate = new Date(scheduledAt.getTime() - FREE_CHANGE_LEAD_MS);
-  if (!current) return candidate.toISOString();
-  const existing = new Date(current);
-  return (existing.getTime() >= candidate.getTime() ? existing : candidate)
-    .toISOString();
+): Promise<string | null> {
+  const { data, error } = await db.rpc("compute_free_change_until", {
+    p_current: current,
+    p_scheduled_at: scheduledAt.toISOString(),
+  });
+  if (error) {
+    console.error(`free_change_until 계산 실패: ${JSON.stringify(error)}`);
+    return current;
+  }
+  return data as string | null;
 }
 
 /**
@@ -220,7 +221,8 @@ async function transition(
     (toStatus === "accepted" && !order.scheduled_at ? now : null);
   if (effectiveScheduled) {
     patch.scheduled_at = effectiveScheduled.toISOString();
-    patch.free_change_until = nextFreeChangeUntil(
+    patch.free_change_until = await nextFreeChangeUntil(
+      db,
       order.free_change_until,
       effectiveScheduled,
     );

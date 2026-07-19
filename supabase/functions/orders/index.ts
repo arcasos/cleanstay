@@ -417,12 +417,20 @@ async function appendEvent(
   orderId: string,
   from: string | null,
   to: string,
+  opts: {
+    reason?: string;
+    fault?: string;
+    metadata?: Record<string, unknown>;
+  } = {},
 ): Promise<void> {
   const { error } = await db.from("order_events").insert({
     order_id: orderId,
     from_status: from,
     to_status: to,
     actor: "tenant",
+    reason: opts.reason ?? null,
+    fault: opts.fault ?? null,
+    metadata: opts.metadata ?? {},
   });
   if (error) console.error(`원장 기록 실패: ${JSON.stringify(error)}`);
 }
@@ -668,6 +676,255 @@ async function getOrdersByRef(
 }
 
 // ---------------------------------------------------------------------------
+// 변경 · 취소
+// ---------------------------------------------------------------------------
+
+/** 이 상태들에서는 더 이상 변경·취소를 받지 않는다. */
+const TERMINAL_STATES = [
+  "completed",
+  "confirmed",
+  "charged",
+  "paid_out",
+  "cancelled",
+  "failed",
+];
+
+interface ChangePreview {
+  compensation_applies: boolean;
+  estimated_amount: number;
+  free_until: string | null;
+  fault: string;
+}
+
+/**
+ * 보상 발생 여부.
+ *
+ * dry_run 과 실제 실행이 **같은 DB 함수**를 본다. 미리보기와 실행이 다른 계산을
+ * 쓰면 "예상과 다른 청구"가 나온다.
+ *
+ * ⚠️ 계산만 한다. claims 행을 만들지 않는다 — 보상 정책이 §13 #5 로 미정이고,
+ *    공급자 약관과 함께 확정될 때까지 집행하지 않는다(v0.3.1).
+ */
+async function previewCompensation(
+  db: SupabaseClient,
+  orderId: string,
+): Promise<ChangePreview> {
+  const { data, error } = await db.rpc("compensation_preview", {
+    p_order_id: orderId,
+  });
+  if (error || !data) {
+    console.error(`보상 미리보기 실패: ${JSON.stringify(error)}`);
+    return {
+      compensation_applies: false,
+      estimated_amount: 0,
+      free_until: null,
+      fault: "none",
+    };
+  }
+  return data as ChangePreview;
+}
+
+interface PatchBody {
+  checkout_at?: unknown;
+  next_checkin_at?: unknown;
+  spec?: unknown;
+  dry_run?: unknown;
+}
+
+async function patchOrder(
+  req: Request,
+  db: SupabaseClient,
+  ctx: TenantContext,
+  orderId: string,
+): Promise<Response> {
+  let body: PatchBody;
+  try {
+    body = await req.json();
+  } catch {
+    return errorResponse(req, "validation_failed", {
+      details: ["요청 본문이 올바른 JSON이 아닙니다."],
+    });
+  }
+
+  const { data: found } = await db.from("orders").select(ORDER_COLS)
+    .eq("id", orderId).eq("tenant_id", ctx.tenantId).eq("env", ctx.env)
+    .maybeSingle();
+  if (!found) return errorResponse(req, "order_not_found");
+  const order = found as unknown as OrderRow;
+
+  if (TERMINAL_STATES.includes(order.status)) {
+    return errorResponse(req, "invalid_state_transition", {
+      details: [`${order.status} 상태에서는 변경할 수 없습니다.`],
+    });
+  }
+
+  const details: string[] = [];
+  const newCheckout = body.checkout_at != null ? parseTs(body.checkout_at) : null;
+  if (body.checkout_at != null && !newCheckout) {
+    details.push("checkout_at은 ISO8601 시각이어야 합니다.");
+  }
+  // null 을 명시적으로 보내면 "다음 예약 없음"으로 지운다. undefined 는 무변경.
+  const clearNext = body.next_checkin_at === null;
+  const newNext = body.next_checkin_at != null
+    ? parseTs(body.next_checkin_at)
+    : null;
+  if (body.next_checkin_at != null && !newNext) {
+    details.push("next_checkin_at은 ISO8601 시각이거나 null이어야 합니다.");
+  }
+  if (
+    body.spec != null &&
+    (typeof body.spec !== "object" || Array.isArray(body.spec))
+  ) {
+    details.push("spec은 객체여야 합니다.");
+  }
+
+  const effCheckout = newCheckout ?? new Date(order.checkout_at);
+  if (new Date(order.checkin_at).getTime() >= effCheckout.getTime()) {
+    details.push("checkout_at은 checkin_at보다 뒤여야 합니다.");
+  }
+  if (details.length > 0) {
+    return errorResponse(req, "validation_failed", { details });
+  }
+
+  const preview = await previewCompensation(db, order.id);
+
+  // dry_run — 실제 변경 없이 보상 발생 여부만 돌려준다.
+  // 호스트에게 사전 안내한 뒤 실제로 호출하라는 것이 이 필드의 취지다.
+  if (body.dry_run === true) {
+    return jsonResponse(req, 200, preview);
+  }
+
+  // deadline_at 재계산. next_checkin_at 이 있으면 그것이 마감이고,
+  // 없으면 checkout_at + 매물별 N시간이다.
+  const { data: propData } = await db.from("properties")
+    .select("cleaning_deadline_hours").eq("id", order.property_id).maybeSingle();
+  const hours =
+    (propData as { cleaning_deadline_hours: number } | null)
+      ?.cleaning_deadline_hours ?? 24;
+
+  const effNext = clearNext
+    ? null
+    : (newNext ?? (order.next_checkin_at ? new Date(order.next_checkin_at) : null));
+  const deadline = effNext ??
+    new Date(effCheckout.getTime() + hours * 60 * 60 * 1000);
+
+  const patch: Record<string, unknown> = {
+    checkout_at: effCheckout.toISOString(),
+    next_checkin_at: effNext?.toISOString() ?? null,
+    deadline_at: deadline.toISOString(),
+  };
+  if (body.spec && typeof body.spec === "object") patch.spec = body.spec;
+
+  const { data: updated, error } = await db.from("orders").update(patch)
+    .eq("id", order.id).select(ORDER_COLS).single();
+  if (error) {
+    console.error(`발주 변경 실패: ${JSON.stringify(error)}`);
+    return errorResponse(req, "db_error");
+  }
+
+  // 원장에 남긴다. 상태는 그대로지만 테넌트가 관측하는 값이 바뀌었다.
+  // 보상이 발생하는 변경이면 그 사실도 함께 기록한다 — 나중에 집행할 때의 근거다.
+  await appendEvent(db, order.id, order.status, order.status, {
+    reason: "tenant_patch",
+    metadata: {
+      compensation_applies: preview.compensation_applies,
+      free_until: preview.free_until,
+      // ⚠️ claims 는 만들지 않는다. 정책 확정 전까지 계산만 한다.
+      claim_created: false,
+    },
+  });
+
+  return jsonResponse(
+    req,
+    200,
+    await toOrderDetail(db, updated as unknown as OrderRow, {
+      withAccessUrl: false,
+    }),
+  );
+}
+
+interface CancelBody {
+  reason?: unknown;
+  fault?: unknown;
+  dry_run?: unknown;
+}
+
+async function cancelOrder(
+  req: Request,
+  db: SupabaseClient,
+  ctx: TenantContext,
+  orderId: string,
+): Promise<Response> {
+  let body: CancelBody;
+  try {
+    body = await req.json();
+  } catch {
+    return errorResponse(req, "validation_failed", {
+      details: ["요청 본문이 올바른 JSON이 아닙니다."],
+    });
+  }
+
+  if (!isStr(body.reason)) {
+    return errorResponse(req, "validation_failed", {
+      details: ["reason은 필수 문자열입니다."],
+    });
+  }
+
+  const { data: found } = await db.from("orders").select(ORDER_COLS)
+    .eq("id", orderId).eq("tenant_id", ctx.tenantId).eq("env", ctx.env)
+    .maybeSingle();
+  if (!found) return errorResponse(req, "order_not_found");
+  const order = found as unknown as OrderRow;
+
+  if (TERMINAL_STATES.includes(order.status)) {
+    return errorResponse(req, "invalid_state_transition", {
+      details: [`${order.status} 상태에서는 취소할 수 없습니다.`],
+    });
+  }
+
+  const preview = await previewCompensation(db, order.id);
+  if (body.dry_run === true) {
+    return jsonResponse(req, 200, preview);
+  }
+
+  // 청구는 애초에 없다. 환불 처리가 불필요하다(v0.3.1).
+  const { data: updated, error } = await db.from("orders").update({
+    status: "cancelled",
+    cancelled_at: new Date().toISOString(),
+    cancel_reason: body.reason,
+    // 테넌트가 보낸 fault 는 참고값이다. 최종 판정은 클린콜이 원장을 근거로 한다.
+    tenant_reported_fault: isStr(body.fault) ? body.fault : null,
+    fault: preview.fault,
+  }).eq("id", order.id).select(ORDER_COLS).single();
+
+  if (error) {
+    console.error(`발주 취소 실패: ${JSON.stringify(error)}`);
+    return errorResponse(req, "db_error");
+  }
+
+  await appendEvent(db, order.id, order.status, "cancelled", {
+    reason: body.reason,
+    fault: preview.fault,
+    metadata: {
+      compensation_applies: preview.compensation_applies,
+      free_until: preview.free_until,
+      tenant_reported_fault: isStr(body.fault) ? body.fault : null,
+      // ⚠️ 취소보상 claim 을 자동 생성하지 않는다.
+      //    정책이 공급자 약관과 함께 확정될 때까지 계산만 하고 집행하지 않는다.
+      claim_created: false,
+    },
+  });
+
+  return jsonResponse(
+    req,
+    200,
+    await toOrderDetail(db, updated as unknown as OrderRow, {
+      withAccessUrl: false,
+    }),
+  );
+}
+
+// ---------------------------------------------------------------------------
 
 Deno.serve(async (req) => {
   const pre = handlePreflight(req);
@@ -695,10 +952,21 @@ Deno.serve(async (req) => {
     return await getOrdersByRef(req, db, ctx, decodeURIComponent(byRef[1]));
   }
 
+  const cancel = path.match(/^\/orders\/([^/]+)\/cancel$/);
+  if (req.method === "POST" && cancel) {
+    if (!UUID_PATTERN.test(cancel[1])) {
+      return errorResponse(req, "order_not_found");
+    }
+    return await cancelOrder(req, db, ctx, cancel[1]);
+  }
+
   const one = path.match(/^\/orders\/([^/]+)$/);
-  if (req.method === "GET" && one) {
-    if (!UUID_PATTERN.test(one[1])) return errorResponse(req, "order_not_found");
-    return await getOrder(req, db, ctx, one[1]);
+  if (one && !UUID_PATTERN.test(one[1])) {
+    return errorResponse(req, "order_not_found");
+  }
+  if (req.method === "GET" && one) return await getOrder(req, db, ctx, one[1]);
+  if (req.method === "PATCH" && one) {
+    return await patchOrder(req, db, ctx, one[1]);
   }
 
   return errorResponse(req, "order_not_found", {
