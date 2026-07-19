@@ -228,8 +228,10 @@ async function createProperty(
   const ref = body.tenant_property_ref as string;
 
   // 멱등 — 이미 등록된 매물이면 기존 값을 200으로 반환한다(201 아님).
+  // env로도 걸러야 한다. 빠뜨리면 test 키가 live 매물을 받아간다.
   const { data: existing } = await db.from("properties").select(PROPERTY_COLS)
-    .eq("tenant_id", ctx.tenantId).eq("tenant_property_ref", ref).maybeSingle();
+    .eq("tenant_id", ctx.tenantId).eq("tenant_property_ref", ref)
+    .eq("env", ctx.env).maybeSingle();
   if (existing) {
     return jsonResponse(
       req,
@@ -292,7 +294,8 @@ async function createProperty(
   if (error) {
     // 동시 요청 경합 — unique 위반이면 재조회해 멱등 응답으로 수렴시킨다.
     const { data: raced } = await db.from("properties").select(PROPERTY_COLS)
-      .eq("tenant_id", ctx.tenantId).eq("tenant_property_ref", ref).maybeSingle();
+      .eq("tenant_id", ctx.tenantId).eq("tenant_property_ref", ref)
+      .eq("env", ctx.env).maybeSingle();
     if (raced) {
       return jsonResponse(req, 200, await toDetail(db, raced as PropertyRow, null));
     }
