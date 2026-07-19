@@ -13,7 +13,7 @@ import {
 } from "../_shared/auth.ts";
 import { handlePreflight, jsonResponse } from "../_shared/cors.ts";
 import { errorResponse } from "../_shared/errors.ts";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { SupabaseClient } from "jsr:@supabase/supabase-js@2";
 
 const ORDER_STATUSES = [
   "created",
@@ -333,7 +333,6 @@ Deno.serve(async (req) => {
   const path = new URL(req.url).pathname
     .replace(/^\/functions\/v1/, "")
     .replace(/^\/v1/, "")
-    .replace(/^\/sandbox-transition/, "/sandbox")
     .replace(/\/+$/, "");
 
   const m = path.match(/^\/sandbox\/orders\/([^/]+)\/transition$/);

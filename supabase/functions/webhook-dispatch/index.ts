@@ -12,7 +12,7 @@
 //    service_role 로 도는 EF이므로 R4에 따라 진입 즉시 caller를 검증한다.
 
 import { serviceClient } from "../_shared/auth.ts";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { SupabaseClient } from "jsr:@supabase/supabase-js@2";
 
 /** 수신 측이 5초 안에 응답하지 못하면 실패로 본다. */
 const DELIVERY_TIMEOUT_MS = 5_000;

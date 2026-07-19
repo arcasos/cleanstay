@@ -15,7 +15,7 @@ import { handlePreflight, jsonResponse } from "../_shared/cors.ts";
 import { errorResponse } from "../_shared/errors.ts";
 import { resolveRegion } from "../_shared/region.ts";
 import { issuePropertySetupToken } from "../_shared/tokens.ts";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { SupabaseClient } from "jsr:@supabase/supabase-js@2";
 
 // ---------------------------------------------------------------------------
 // 입력 검증
@@ -365,7 +365,6 @@ Deno.serve(async (req) => {
   const path = new URL(req.url).pathname
     .replace(/^\/functions\/v1/, "")
     .replace(/^\/v1/, "")
-    .replace(/^\/properties-create/, "/properties")
     .replace(/\/+$/, "");
 
   if (req.method === "POST" && (path === "/properties" || path === "")) {

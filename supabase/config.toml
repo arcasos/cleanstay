@@ -395,10 +395,10 @@ deno_version = 2
 #    CLAUDE.md R4에 따라 각 함수가 진입 즉시 caller를 자체 검증해야 한다.
 # ---------------------------------------------------------------------------
 
-[functions.properties-create]
+[functions.properties]
 verify_jwt = false
 
-[functions.orders-create]
+[functions.orders]
 verify_jwt = false
 
 [analytics]
@@ -429,7 +429,7 @@ enabled = true
 # JSON string passed through to pg-delta SQL formatting.
 # format_options = "{\"keywordCase\":\"upper\",\"indent\":2,\"maxWidth\":80,\"commaStyle\":\"trailing\"}"
 
-[functions.sandbox-transition]
+[functions.sandbox]
 verify_jwt = false
 
 # 워커. 테넌트 API가 아니며 WEBHOOK_WORKER_TOKEN 으로 보호한다.

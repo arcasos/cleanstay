@@ -10,7 +10,7 @@
 // 양쪽이 일치한다. 반환된 B코드(법정동)를 region_codes와 대조해 우리가 아는 코드일
 // 때만 채택한다 — 서울(11 접두) 밖이면 미지원이 아니라 해석 실패다.
 
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { SupabaseClient } from "jsr:@supabase/supabase-js@2";
 
 const KAKAO_COORD2REGION =
   "https://dapi.kakao.com/v2/local/geo/coord2regioncode.json";

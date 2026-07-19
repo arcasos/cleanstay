@@ -8,7 +8,7 @@
 //           key_prefix = 평문 앞 16자 (식별·조회용)
 // 평문은 발급 시 1회만 반환하고 저장하지 않는다.
 
-import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import { createClient, type SupabaseClient } from "jsr:@supabase/supabase-js@2";
 
 export type Env = "live" | "test";
 

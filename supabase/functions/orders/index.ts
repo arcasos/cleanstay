@@ -14,7 +14,7 @@ import {
 import { handlePreflight, jsonResponse } from "../_shared/cors.ts";
 import { errorResponse } from "../_shared/errors.ts";
 import { issueOrderAccessToken } from "../_shared/tokens.ts";
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { SupabaseClient } from "jsr:@supabase/supabase-js@2";
 
 const TRIGGER_TYPES = ["scheduled", "early_checkout", "rework"] as const;
 const PRIORITIES = ["normal", "urgent"] as const;
@@ -419,7 +419,6 @@ Deno.serve(async (req) => {
   const path = new URL(req.url).pathname
     .replace(/^\/functions\/v1/, "")
     .replace(/^\/v1/, "")
-    .replace(/^\/orders-create/, "/orders")
     .replace(/\/+$/, "");
 
   if (req.method === "POST" && (path === "/orders" || path === "")) {

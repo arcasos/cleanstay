@@ -39,7 +39,7 @@
  * 없을 때만 생성한다. API 키는 살아 있는 키가 있으면 건너뛴다(`--rotate` 제외).
  */
 
-import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import { createClient, type SupabaseClient } from "jsr:@supabase/supabase-js@2";
 import { issueApiKey, type Env } from "../functions/_shared/auth.ts";
 
 // ---------------------------------------------------------------------------

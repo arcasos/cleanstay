@@ -6,7 +6,7 @@
 //
 // ⚠️ 호스트 설정 페이지는 아직 없다. 지금은 토큰 발급과 URL 형태만 확정한다.
 
-import type { SupabaseClient } from "@supabase/supabase-js";
+import type { SupabaseClient } from "jsr:@supabase/supabase-js@2";
 import { sha256Hex } from "./auth.ts";
 
 export type TokenScope = "property" | "order";

@@ -1,6 +1,7 @@
 {
   "version": "5",
   "specifiers": {
+    "jsr:@supabase/supabase-js@2": "2.110.2",
     "jsr:@supabase/supabase-js@^2.110.2": "2.110.2",
     "npm:@supabase/auth-js@2.110.2": "2.110.2",
     "npm:@supabase/functions-js@2.110.2": "2.110.2",
