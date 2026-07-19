@@ -431,3 +431,7 @@ enabled = true
 
 [functions.sandbox-transition]
 verify_jwt = false
+
+# 워커. 테넌트 API가 아니며 WEBHOOK_WORKER_TOKEN 으로 보호한다.
+[functions.webhook-dispatch]
+verify_jwt = false
