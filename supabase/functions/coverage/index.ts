@@ -81,12 +81,14 @@ async function checkCoverage(req: Request): Promise<Response> {
   }
 
   const db = anonClient();
+  // "rpc" 모드 — anon 은 region_codes 테이블 권한이 없다. SECURITY DEFINER 함수가
+  // 미지원 지역까지 포함해 해석 결과 세 컬럼만 돌려준다.
   const region = await resolveRegion(db, {
     region_code: body.region_code as string | null,
     lat: typeof body.lat === "number" ? body.lat : null,
     lng: typeof body.lng === "number" ? body.lng : null,
     address: body.address as string | null,
-  });
+  }, "rpc");
 
   // ⚠️ 해석 실패는 serviceable=false 가 아니라 region_code=null 이다.
   //    "모르는 지역"과 "아는데 아직 공급자가 없는 동"은 다르다.

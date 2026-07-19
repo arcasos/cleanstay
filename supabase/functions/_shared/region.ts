@@ -30,11 +30,41 @@ export interface ResolvedRegion {
 
 const CODE_PATTERN = /^[0-9]{10}$/;
 
+/**
+ * 코드 조회 경로.
+ *
+ * - `table` — region_codes 를 직접 읽는다. service_role 로 도는 EF 용.
+ * - `rpc`   — resolve_region_public() 을 호출한다. **인증 없는 경로(coverage) 용.**
+ *             anon 에게 region_codes 테이블 권한이 없으므로 이 경로여야 한다.
+ *             SECURITY DEFINER 함수가 세 컬럼만 돌려준다.
+ */
+export type LookupMode = "table" | "rpc";
+
 /** region_codes에 있는 코드만 채택한다. 없으면 null. */
 async function lookup(
   db: SupabaseClient,
   code: string,
+  mode: LookupMode,
 ): Promise<ResolvedRegion | null> {
+  if (mode === "rpc") {
+    const { data, error } = await db.rpc("resolve_region_public", {
+      p_code: code,
+    });
+    if (error) {
+      console.error(`지역 해석 RPC 실패: ${JSON.stringify(error)}`);
+      return null;
+    }
+    const rows = (data ?? []) as Array<
+      { region_code: string; region_name: string; serviceable: boolean }
+    >;
+    if (rows.length === 0) return null;
+    return {
+      regionCode: rows[0].region_code,
+      regionName: rows[0].region_name,
+      isServiceable: rows[0].serviceable,
+    };
+  }
+
   const { data, error } = await db
     .from("region_codes")
     .select("code, full_name, is_serviceable, is_active")
@@ -68,6 +98,7 @@ async function fromCoords(
   db: SupabaseClient,
   lat: number,
   lng: number,
+  mode: LookupMode,
 ): Promise<ResolvedRegion | null> {
   const apiKey = Deno.env.get("KAKAO_REST_API_KEY");
   if (!apiKey) {
@@ -94,7 +125,7 @@ async function fromCoords(
   const b = payload.documents?.find((d) => d.region_type === "B");
   if (!b || !CODE_PATTERN.test(b.code)) return null;
 
-  return await lookup(db, b.code);
+  return await lookup(db, b.code, mode);
 }
 
 /**
@@ -105,11 +136,12 @@ async function fromCoords(
 export async function resolveRegion(
   db: SupabaseClient,
   input: RegionInput,
+  mode: LookupMode = "table",
 ): Promise<ResolvedRegion | null> {
   // 1순위 — 명시된 region_code. 형식이 맞아도 우리가 모르는 코드면 실패다.
   if (input.region_code) {
     if (!CODE_PATTERN.test(input.region_code)) return null;
-    return await lookup(db, input.region_code);
+    return await lookup(db, input.region_code, mode);
   }
 
   // 2순위 — 좌표. 주소 문자열 파싱보다 정확하다.
@@ -121,7 +153,7 @@ export async function resolveRegion(
     ) {
       return null;
     }
-    return await fromCoords(db, input.lat, input.lng);
+    return await fromCoords(db, input.lat, input.lng, mode);
   }
 
   // 3순위 — address만. 지오코딩은 범위 밖이므로 해석하지 않는다.
