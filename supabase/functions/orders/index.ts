@@ -92,6 +92,7 @@ interface OrderRow {
   deadline_at: string | null;
   scheduled_at: string | null;
   arrival_at: string | null;
+  completed_at: string | null;
   base_amount: number;
   urgent_premium: number;
   charge_amount: number;
@@ -104,7 +105,7 @@ interface OrderRow {
 
 const ORDER_COLS =
   "id, tenant_ref, property_id, host_id, provider_id, status, trigger_type, priority, " +
-  "checkin_at, checkout_at, next_checkin_at, deadline_at, scheduled_at, arrival_at, " +
+  "checkin_at, checkout_at, next_checkin_at, deadline_at, scheduled_at, arrival_at, completed_at, " +
   "base_amount, urgent_premium, charge_amount, charged_at, fault, free_change_until, " +
   "sequence, updated_at";
 
@@ -925,6 +926,197 @@ async function cancelOrder(
 }
 
 // ---------------------------------------------------------------------------
+// 클레임
+// ---------------------------------------------------------------------------
+
+const CLAIM_TYPES = ["cleaning_defect", "property_damage", "other"];
+const REPORTED_BY = ["host", "guest", "tenant"];
+
+interface ClaimRow {
+  id: string;
+  order_id: string;
+  type: string;
+  status: string;
+  fault: string;
+  claimed_amount: number | null;
+  approved_amount: number | null;
+  opened_at: string;
+  resolved_at: string | null;
+}
+
+const CLAIM_COLS =
+  "id, order_id, type, status, fault, claimed_amount, approved_amount, opened_at, resolved_at";
+
+function toClaim(c: ClaimRow): Record<string, unknown> {
+  return {
+    claim_id: c.id,
+    order_id: c.order_id,
+    type: c.type,
+    status: c.status,
+    fault: c.fault,
+    claimed_amount: c.claimed_amount,
+    approved_amount: c.approved_amount,
+    opened_at: c.opened_at,
+    resolved_at: c.resolved_at,
+  };
+}
+
+/** 발주를 테넌트·env 범위에서 찾는다. 없으면 null (호출부가 404). */
+async function findOrder(
+  db: SupabaseClient,
+  ctx: TenantContext,
+  orderId: string,
+): Promise<OrderRow | null> {
+  const { data } = await db.from("orders").select(ORDER_COLS)
+    .eq("id", orderId).eq("tenant_id", ctx.tenantId).eq("env", ctx.env)
+    .maybeSingle();
+  return data ? (data as unknown as OrderRow) : null;
+}
+
+interface ClaimBody {
+  type?: unknown;
+  description?: unknown;
+  photos?: unknown;
+  claimed_amount?: unknown;
+  reported_by?: unknown;
+}
+
+/**
+ * POST /v1/orders/{id}/claims — 클레임 접수
+ *
+ * 호스트는 클린콜에 상시 로그인하지 않으므로 테넌트가 대신 접수한다.
+ *
+ * ⚠️ 이건 자동 생성이 아니라 **테넌트의 명시적 접수**다. 취소·변경 시
+ *    보상 claim 을 자동으로 만들지 않는다는 제약(§13 #5)과 충돌하지 않는다.
+ */
+async function createClaim(
+  req: Request,
+  db: SupabaseClient,
+  ctx: TenantContext,
+  orderId: string,
+): Promise<Response> {
+  let body: ClaimBody;
+  try {
+    body = await req.json();
+  } catch {
+    return errorResponse(req, "validation_failed", {
+      details: ["요청 본문이 올바른 JSON이 아닙니다."],
+    });
+  }
+
+  const order = await findOrder(db, ctx, orderId);
+  if (!order) return errorResponse(req, "order_not_found");
+
+  const details: string[] = [];
+  if (!isStr(body.type) || !CLAIM_TYPES.includes(body.type)) {
+    details.push(`type은 ${CLAIM_TYPES.join(" | ")} 중 하나여야 합니다.`);
+  }
+  if (!isStr(body.description)) {
+    details.push("description은 필수 문자열입니다.");
+  } else if ((body.description as string).length > 2000) {
+    details.push("description은 2000자를 넘을 수 없습니다.");
+  }
+  if (body.photos != null && !Array.isArray(body.photos)) {
+    details.push("photos는 URL 문자열 배열이어야 합니다.");
+  }
+  if (
+    body.claimed_amount != null &&
+    (!isInt(body.claimed_amount) || body.claimed_amount < 0)
+  ) {
+    details.push("claimed_amount는 0 이상의 정수(원)여야 합니다.");
+  }
+  if (
+    body.reported_by != null &&
+    (!isStr(body.reported_by) || !REPORTED_BY.includes(body.reported_by))
+  ) {
+    details.push(`reported_by는 ${REPORTED_BY.join(" | ")} 중 하나여야 합니다.`);
+  }
+  if (details.length > 0) {
+    return errorResponse(req, "validation_failed", { details });
+  }
+
+  // 접수 기한 — 완료 보고 후 7일. 기준은 상태가 아니라 completed_at 이다.
+  // confirmed·charged 이후에도 열려 있다(보상은 별도 트랙).
+  const { data: open } = await db.rpc("claim_window_open", {
+    p_order_id: order.id,
+  });
+  if (open !== true) {
+    return errorResponse(req, "claim_window_closed", {
+      details: [
+        order.status === "completed" || order.completed_at
+          ? "완료 보고 후 7일이 지나 접수할 수 없습니다."
+          : "아직 완료 보고되지 않은 발주입니다.",
+      ],
+    });
+  }
+
+  const { data: created, error } = await db.from("claims").insert({
+    order_id: order.id,
+    type: body.type,
+    status: "open",
+    // 귀책은 접수 시점에 정하지 않는다. 클린콜이 원장을 근거로 판정한다.
+    fault: "none",
+    claimed_amount: isInt(body.claimed_amount) ? body.claimed_amount : null,
+    description: body.description,
+    evidence: { photos: Array.isArray(body.photos) ? body.photos : [] },
+    opened_by: "tenant",
+    reported_by: isStr(body.reported_by) ? body.reported_by : "host",
+  }).select(CLAIM_COLS).single();
+
+  if (error) {
+    console.error(`클레임 접수 실패: ${JSON.stringify(error)}`);
+    return errorResponse(req, "db_error");
+  }
+
+  const claim = created as unknown as ClaimRow;
+
+  // claim.updated webhook. 발주 상태 전이가 아니므로 order_events 트리거로는
+  // 잡히지 않는다. 여기서 직접 큐에 넣는다.
+  const { data: tenantRow } = await db.from("tenants")
+    .select("webhook_url").eq("id", ctx.tenantId).maybeSingle();
+  if ((tenantRow as { webhook_url: string | null } | null)?.webhook_url) {
+    const { error: whErr } = await db.from("webhook_deliveries").insert({
+      tenant_id: ctx.tenantId,
+      order_id: order.id,
+      claim_id: claim.id,
+      event: "claim.updated",
+      sequence: order.sequence,
+      occurred_at: claim.opened_at,
+      payload: {
+        event: "claim.updated",
+        sequence: order.sequence,
+        occurred_at: claim.opened_at,
+        data: toClaim(claim),
+      },
+      status: "pending",
+      next_retry_at: new Date().toISOString(),
+    });
+    if (whErr) console.error(`claim webhook 큐 실패: ${JSON.stringify(whErr)}`);
+  }
+
+  return jsonResponse(req, 201, toClaim(claim));
+}
+
+async function listClaims(
+  req: Request,
+  db: SupabaseClient,
+  ctx: TenantContext,
+  orderId: string,
+): Promise<Response> {
+  // 발주를 먼저 테넌트·env 범위에서 확인한다. claims 자체에는 env 가 없고
+  // order_id 로 유도되므로, 여기서 걸러야 타 env 클레임이 새지 않는다.
+  const order = await findOrder(db, ctx, orderId);
+  if (!order) return errorResponse(req, "order_not_found");
+
+  const { data } = await db.from("claims").select(CLAIM_COLS)
+    .eq("order_id", order.id).order("opened_at", { ascending: true });
+
+  return jsonResponse(req, 200, {
+    claims: ((data ?? []) as unknown as ClaimRow[]).map(toClaim),
+  });
+}
+
+// ---------------------------------------------------------------------------
 
 Deno.serve(async (req) => {
   const pre = handlePreflight(req);
@@ -950,6 +1142,19 @@ Deno.serve(async (req) => {
   const byRef = path.match(/^\/orders\/by-ref\/(.+)$/);
   if (req.method === "GET" && byRef) {
     return await getOrdersByRef(req, db, ctx, decodeURIComponent(byRef[1]));
+  }
+
+  const claims = path.match(/^\/orders\/([^/]+)\/claims$/);
+  if (claims) {
+    if (!UUID_PATTERN.test(claims[1])) {
+      return errorResponse(req, "order_not_found");
+    }
+    if (req.method === "POST") {
+      return await createClaim(req, db, ctx, claims[1]);
+    }
+    if (req.method === "GET") {
+      return await listClaims(req, db, ctx, claims[1]);
+    }
   }
 
   const cancel = path.match(/^\/orders\/([^/]+)\/cancel$/);

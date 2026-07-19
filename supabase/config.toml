@@ -435,3 +435,8 @@ verify_jwt = false
 # 워커. 테넌트 API가 아니며 WEBHOOK_WORKER_TOKEN 으로 보호한다.
 [functions.webhook-dispatch]
 verify_jwt = false
+
+# 커버리지는 인증 없이 열려 있다(스펙 security: []).
+# 검증할 caller 가 없는 것이 설계이며, 참조 데이터 읽기만 한다.
+[functions.coverage]
+verify_jwt = false

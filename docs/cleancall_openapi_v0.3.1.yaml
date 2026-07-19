@@ -1195,8 +1195,17 @@ components:
       properties:
         compensation_applies: { type: boolean }
         estimated_amount:
-          type: integer
-          description: 예상 취소보상액(원). 미발생 시 0.
+          type: [integer, 'null']
+          description: |
+            예상 취소보상액(원). 미발생 시 0.
+
+            **현재는 항상 `null`입니다.** 보상 금액 정책이 확정되지 않았습니다(시드 §13 #5).
+            `null`은 "금액 미정"이지 "보상 없음"이 아닙니다 — 보상 발생 여부는
+            `compensation_applies`가 단독으로 나타냅니다.
+
+            `compensation_applies: true` + `estimated_amount: null` 조합은
+            **"보상은 발생하나 금액이 아직 정해지지 않았다"**를 뜻합니다.
+            정책 확정 시 정수 금액으로 채워집니다.
         free_until:
           type: [string, 'null']
           format: date-time
