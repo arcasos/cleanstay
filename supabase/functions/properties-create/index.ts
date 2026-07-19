@@ -246,12 +246,19 @@ async function createProperty(
     address: body.address as string,
   });
   if (!region) {
-    return errorResponse(req, "region_unresolved", {
-      details: [
-        "region_code, 또는 lat/lng 좌표가 필요합니다. " +
-        "주소 문자열만으로는 지역을 해석하지 않습니다.",
-      ],
-    });
+    // 무엇을 보냈는지에 따라 사유를 구분한다. 좌표를 보낸 테넌트에게
+    // "좌표가 필요합니다"라고 답하면 무엇을 고쳐야 할지 알 수 없다.
+    const gaveCode = body.region_code != null;
+    const gaveCoords = isNum(body.lat) && isNum(body.lng);
+    const detail = gaveCode
+      ? `region_code '${body.region_code}' 는 서비스 대상 지역이 아닙니다. ` +
+        "현재 서울(법정동코드 11 접두)만 지원합니다."
+      : gaveCoords
+      ? "좌표를 법정동코드로 해석하지 못했습니다. " +
+        "현재 서울(법정동코드 11 접두)만 지원하며, 좌표계는 WGS84여야 합니다."
+      : "region_code 또는 lat/lng 좌표가 필요합니다. " +
+        "주소 문자열만으로는 지역을 해석하지 않습니다.";
+    return errorResponse(req, "region_unresolved", { details: [detail] });
   }
 
   const hostId = await upsertHost(db, ctx.tenantId, body.host as HostInput);
