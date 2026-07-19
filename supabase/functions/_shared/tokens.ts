@@ -61,3 +61,41 @@ export async function issuePropertySetupToken(
 
   return { url: `${setupBaseUrl()}/access/${plain}`, expiresAt };
 }
+
+/**
+ * 발주 단위 출입정보 갱신 토큰 발급.
+ *
+ * 도어락 비밀번호처럼 게스트마다 바뀌는 값을 그 발주 건에만 적용해 갱신한다.
+ * 링크는 해당 발주의 청소 완료 시점까지 유효해야 하므로, 완료 시점을 알 수 없는
+ * 생성 시점에서는 마감 기한에 여유를 더해 잡는다.
+ */
+export async function issueOrderAccessToken(
+  db: SupabaseClient,
+  opts: { orderId: string; hostId: string; deadlineAt: string },
+): Promise<IssuedToken | null> {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  const plain = Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+
+  // 마감 + 7일. 재청소·지연을 흡수하되 무기한으로 열어두지는 않는다.
+  const expiresAt = new Date(
+    new Date(opts.deadlineAt).getTime() + 7 * 24 * 60 * 60 * 1000,
+  ).toISOString();
+
+  const { error } = await db.from("access_update_tokens").insert({
+    token_hash: await sha256Hex(plain),
+    scope: "order",
+    order_id: opts.orderId,
+    host_id: opts.hostId,
+    expires_at: expiresAt,
+  });
+
+  if (error) {
+    console.error(`발주 출입정보 토큰 발급 실패: ${JSON.stringify(error)}`);
+    return null;
+  }
+
+  return { url: `${setupBaseUrl()}/access/${plain}`, expiresAt };
+}
