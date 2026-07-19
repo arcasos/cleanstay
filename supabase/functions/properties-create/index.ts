@@ -324,8 +324,12 @@ async function getProperty(
 ): Promise<Response> {
   // tenant_id로 함께 걸러 타 테넌트 리소스는 404가 되게 한다.
   // 403을 주면 "그 ID가 존재한다"를 알려주는 셈이라 테넌트 간 ID 열거가 가능해진다.
+  //
+  // env도 같은 이유로 필터한다. 빠뜨리면 test 키가 live 매물 UUID를 알고 있을 때
+  // 그대로 읽어간다 — 테넌트 간 격리와 같은 급의 누출이다.
   const { data } = await db.from("properties").select(PROPERTY_COLS)
-    .eq("id", propertyId).eq("tenant_id", ctx.tenantId).maybeSingle();
+    .eq("id", propertyId).eq("tenant_id", ctx.tenantId)
+    .eq("env", ctx.env).maybeSingle();
 
   if (!data) return errorResponse(req, "property_not_found");
   return jsonResponse(req, 200, await toDetail(db, data as PropertyRow, null));
