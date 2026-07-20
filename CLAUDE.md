@@ -201,8 +201,10 @@ reconciliation(`GET /orders?updated_since=`)이 잡는다 — `updated_at` 과
 대안: 발급 시 이전 미사용 토큰 무효화(항상 1개만 유효, 대신 이미 보낸 링크가 죽음)
 또는 평문 암호화 저장(`property_access_info` 의 `ciphertext`/`key_version` 스킴 재사용).
 
-**`SETUP_BASE_URL` 기본값이 `https://setup.cleancall.local`이다.** §13 #1 도메인 미정.
-발급된 링크가 실제로 열리지 않는다. 도메인 확정 시 EF 시크릿에 넣는다.
+**출입정보 링크가 아직 열리지 않는다.** 도메인은 `cleanstay.co.kr` 로 확정됐고
+`SETUP_BASE_URL` 도 반영됐지만, **호스트 설정 페이지 자체가 없다.**
+발급되는 `https://cleanstay.co.kr/access/{token}` 은 지금 죽은 링크다.
+아르카가 알림톡 템플릿을 준비하는 것은 무방하나 **실제 발송은 페이지 완성 후**여야 한다.
 
 **dev DB에 검증 잔여물이 있다.** 발주 5건 + `order_events` 다수.
 R5 append-only 트리거가 DELETE를 막아 지우려면 트리거를 일시 비활성해야 한다.

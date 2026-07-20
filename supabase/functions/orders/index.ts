@@ -392,11 +392,18 @@ async function findExisting(
   tenantRef: string,
   triggerType: TriggerType,
 ): Promise<Response | null> {
+  // ⚠️ 취소·실패한 발주는 멱등 대상이 아니다.
+  //    종료된 발주가 키를 점유하면 같은 예약으로 재발주할 수 없다 —
+  //    예약이 되살아나거나 운영자가 잘못 취소한 경우가 전부 막힌다.
+  //    DB 의 부분 유니크 인덱스(20260720000007)와 같은 조건이어야 한다.
+  //    한쪽만 고치면 INSERT 가 23505 로 막히고 경합 경로로 빠져
+  //    취소된 발주를 그대로 반환한다 — 고치기 전과 같아진다.
   const { data } = await db.from("orders").select(ORDER_COLS)
     .eq("tenant_id", ctx.tenantId)
     .eq("tenant_ref", tenantRef)
     .eq("trigger_type", triggerType)
     .eq("env", ctx.env)
+    .not("status", "in", "(cancelled,failed)")
     .maybeSingle();
   if (!data) return null;
 
