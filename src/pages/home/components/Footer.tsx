@@ -4,7 +4,7 @@ export default function Footer() {
       <div className="max-w-5xl mx-auto px-6">
         <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
           <div>
-            <span className="font-semibold text-foreground-950 text-sm">클린콜</span>
+            <span className="font-semibold text-foreground-950 text-sm">클린스테이</span>
             <p className="text-xs text-foreground-400 mt-0.5">STR 청소 디스패치 플랫폼</p>
           </div>
           <div className="flex flex-wrap gap-x-5 gap-y-2">

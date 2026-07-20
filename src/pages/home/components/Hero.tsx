@@ -5,8 +5,8 @@ export default function Hero() {
       <div className="absolute inset-0">
         <img
           src="https://readdy.ai/api/search-image?query=Modern%20minimalist%20Korean%20hotel%20suite%20interior%20with%20warm%20natural%20sunlight%20streaming%20through%20floor%20to%20ceiling%20windows%2C%20pristine%20white%20bedding%20on%20a%20wooden%20platform%20bed%2C%20soft%20beige%20and%20cream%20tones%2C%20peaceful%20zen%20atmosphere%2C%20clean%20architectural%20lines%2C%20subtle%20shadows%2C%20editorial%20interior%20design%20photography%2C%20high%20end%20accommodation%20aesthetic%2C%20uncluttered%20serene%20space&width=1600&height=900&seq=cleancall-hero-bg&orientation=landscape"
-          alt="모던 호텔 스위트 인테리어 - 클린콜 청소 자동화 서비스"
-          title="클린콜 STR 턴오버 청소 자동화 플랫폼"
+          alt="모던 호텔 스위트 인테리어 - 클린스테이 청소 자동화 서비스"
+          title="클린스테이 STR 턴오버 청소 자동화 플랫폼"
           className="w-full h-full object-cover object-top"
         />
         {/* Dark gradient overlay for text readability */}

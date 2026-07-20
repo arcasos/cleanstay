@@ -22,10 +22,10 @@ export default function Navbar() {
       <div className="max-w-5xl mx-auto px-6 h-full flex items-center justify-between w-full">
         <a href="#" className="flex items-baseline gap-1.5">
           <span className={`font-semibold text-base transition-colors duration-300 ${scrolled ? 'text-foreground-950' : 'text-white'}`}>
-            클린콜
+            클린스테이
           </span>
           <span className={`text-[11px] tracking-wider font-medium transition-colors duration-300 ${scrolled ? 'text-foreground-400' : 'text-white/50'}`}>
-            CLEANCALL
+            CLEANSTAY
           </span>
         </a>
 

@@ -7,7 +7,7 @@ export default function CTABand() {
           <div className="absolute inset-0">
             <img
               src="https://readdy.ai/api/search-image?query=Warm%20inviting%20modern%20office%20meeting%20space%20with%20comfortable%20seating%20and%20soft%20ambient%20lighting%2C%20large%20windows%20with%20city%20view%2C%20professional%20consultation%20atmosphere%2C%20clean%20minimalist%20Korean%20interior%20design%2C%20subtle%20greenery%2C%20golden%20hour%20light%2C%20welcoming%20business%20environment%2C%20shallow%20depth%20of%20field&width=1600&height=600&seq=cta-bg&orientation=landscape"
-              alt="클린콜 도입 상담"
+              alt="클린스테이 도입 상담"
               className="w-full h-full object-cover"
             />
             {/* Dark overlay */}

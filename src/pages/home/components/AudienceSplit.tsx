@@ -16,7 +16,7 @@ export default function AudienceSplit() {
             <div className="w-full h-[220px] overflow-hidden">
               <img
                 src="https://readdy.ai/api/search-image?query=Modern%20accommodation%20management%20dashboard%20on%20large%20monitor%20showing%20multiple%20property%20listings%20and%20booking%20calendar%2C%20clean%20minimalist%20interface%20design%2C%20warm%20ambient%20office%20lighting%2C%20professional%20host%20workspace%20with%20plants%20and%20notebook%2C%20soft%20shadows%2C%20editorial%20tech%20workplace%20photography%2C%20serene%20productive%20atmosphere&width=800&height=500&seq=aud-operator&orientation=landscape"
-                alt="숙박 운영자 대시보드 - 클린콜 호스트 솔루션"
+                alt="숙박 운영자 대시보드 - 클린스테이 호스트 솔루션"
                 className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
               />
             </div>
@@ -56,7 +56,7 @@ export default function AudienceSplit() {
             <div className="w-full h-[220px] overflow-hidden">
               <img
                 src="https://readdy.ai/api/search-image?query=Professional%20cleaning%20team%20of%20two%20people%20in%20matching%20uniforms%20with%20cleaning%20equipment%20cart%20in%20bright%20modern%20hotel%20corridor%2C%20warm%20natural%20light%20from%20windows%2C%20smiling%20confident%20expressions%2C%20pristine%20environment%2C%20editorial%20commercial%20photography%2C%20soft%20neutral%20tones%2C%20teamwork%20and%20reliability%20aesthetic&width=800&height=500&seq=aud-cleaner&orientation=landscape"
-                alt="청소 공급자 팀 - 클린콜 파트너 솔루션"
+                alt="청소 공급자 팀 - 클린스테이 파트너 솔루션"
                 className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
               />
             </div>
