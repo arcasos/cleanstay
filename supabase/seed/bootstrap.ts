@@ -49,14 +49,14 @@ import { issueApiKey, type Env } from "../functions/_shared/auth.ts";
 const TENANT = { slug: "arcasos", name: "ARCASOS", status: "active" };
 
 const API_KEYS: Array<{ env: Env; label: string }> = [
-  { env: "live", label: "arcasos-dev" },
-  { env: "test", label: "arcasos-sandbox" },
+  { env: "live", label: "arcasos-live" },
+  { env: "test", label: "arcasos-test" },
 ];
 
 const HOST = { tenant_host_ref: "host_test_001", display_name: "테스트호스트" };
 
 /** 서비스 지역으로 열 구역. 법정동코드 접두 매칭(CLAUDE.md §4). */
-const SERVICEABLE_PREFIX = "11680"; // 강남구
+const SERVICEABLE_PREFIXES = ["11680", "11650"]; // 강남구, 서초구
 
 const PROPERTIES = [
   {
@@ -267,25 +267,43 @@ async function seedHost(
 }
 
 async function seedCoverage(sb: SupabaseClient): Promise<void> {
-  // 강남구만 열고 나머지는 닫는다. 커버리지 테스트에 양쪽이 다 필요하다.
-  const opened = mustRow<IdRow[]>(
-    await sb.from("region_codes")
-      .update({ is_serviceable: true })
-      .like("code", `${SERVICEABLE_PREFIX}%`)
-      .select("code"),
-    "커버리지 개방",
+  // 지정한 구만 열고 나머지는 닫는다.
+  // 커버리지 테스트에는 지원·미지원 지역이 **둘 다** 필요하다 —
+  // pending_coverage 경로와 422 경로를 구분해 검증해야 하기 때문이다.
+  let opened = 0;
+  for (const prefix of SERVICEABLE_PREFIXES) {
+    const rows = mustRow<IdRow[]>(
+      await sb.from("region_codes")
+        .update({ is_serviceable: true })
+        .like("code", `${prefix}%`)
+        .select("code"),
+      `커버리지 개방(${prefix})`,
+    );
+    opened += rows.length;
+  }
+
+  // 목록 밖인데 열려 있는 것을 닫는다. PostgREST 에 "여러 like 를 모두 부정"이
+  // 없으므로 전체를 훑어 접두로 거른다.
+  const all = mustRow<Array<{ code: string }>>(
+    await sb.from("region_codes").select("code").eq("is_serviceable", true),
+    "커버리지 현황 조회",
   );
-  const closed = mustRow<IdRow[]>(
-    await sb.from("region_codes")
-      .update({ is_serviceable: false })
-      .not("code", "like", `${SERVICEABLE_PREFIX}%`)
-      .eq("is_serviceable", true)
-      .select("code"),
-    "커버리지 차단",
-  );
+  const stale = all
+    .map((r) => r.code)
+    .filter((c) => !SERVICEABLE_PREFIXES.some((p) => c.startsWith(p)));
+  if (stale.length > 0) {
+    mustRow<IdRow[]>(
+      await sb.from("region_codes")
+        .update({ is_serviceable: false })
+        .in("code", stale)
+        .select("code"),
+      "커버리지 차단",
+    );
+  }
+
   log(
-    `  커버리지    ${SERVICEABLE_PREFIX} 접두 ${opened.length}건 개방` +
-      (closed.length ? `, 범위 밖 ${closed.length}건 차단` : ""),
+    `  커버리지    ${SERVICEABLE_PREFIXES.join("+")} 접두 ${opened}건 개방` +
+      (stale.length ? `, 범위 밖 ${stale.length}건 차단` : ""),
   );
 }
 

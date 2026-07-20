@@ -240,11 +240,14 @@ async function createProperty(
     .eq("tenant_id", ctx.tenantId).eq("tenant_property_ref", ref)
     .eq("env", ctx.env).maybeSingle();
   if (existing) {
-    return jsonResponse(
-      req,
-      200,
-      await toDetail(db, existing as PropertyRow, null),
-    );
+    // ⚠️ 갱신하지 않는다(upsert 아님). POST 는 생성이고, 재호출로 조용히 값을
+    //    덮으면 의도치 않은 변경이 눈에 안 띈다. 수정은 PATCH 가 한다.
+    //    대신 idempotent_replay 로 "새로 만들지 않았다"를 분명히 알린다 —
+    //    이게 없어서 아르카가 "재등록했는데 반영 안 됨"을 몰랐다.
+    return jsonResponse(req, 200, {
+      ...await toDetail(db, existing as PropertyRow, null),
+      idempotent_replay: true,
+    });
   }
 
   // 지역 해석. 실패는 오류(422)지만, 미지원 지역은 오류가 아니라 pending_coverage다.
@@ -309,7 +312,10 @@ async function createProperty(
       .eq("tenant_id", ctx.tenantId).eq("tenant_property_ref", ref)
       .eq("env", ctx.env).maybeSingle();
     if (raced) {
-      return jsonResponse(req, 200, await toDetail(db, raced as PropertyRow, null));
+      return jsonResponse(req, 200, {
+        ...await toDetail(db, raced as PropertyRow, null),
+        idempotent_replay: true,
+      });
     }
     console.error(`매물 생성 실패: ${JSON.stringify(error)}`);
     return errorResponse(req, "db_error");
@@ -321,7 +327,10 @@ async function createProperty(
     hostId,
   });
 
-  return jsonResponse(req, 201, await toDetail(db, row, token?.url ?? null));
+  return jsonResponse(req, 201, {
+    ...await toDetail(db, row, token?.url ?? null),
+    idempotent_replay: false,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -352,6 +361,249 @@ async function getProperty(
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+// ---------------------------------------------------------------------------
+// PATCH /v1/properties/{id}
+// ---------------------------------------------------------------------------
+
+/** 클라이언트가 직접 지정할 수 있는 상태. */
+const SETTABLE_STATUS = ["active", "inactive"];
+
+/**
+ * 지역에 영향을 주는 필드.
+ *
+ * 하나라도 바뀌면 재해석하고 serviceable 을 다시 판정한다.
+ * active <-> pending_coverage 전이가 여기서 발생한다.
+ */
+const REGION_FIELDS = ["address", "lat", "lng", "region_code"];
+
+interface PropertyPatchBody {
+  name?: unknown;
+  address?: unknown;
+  address_detail?: unknown;
+  region_code?: unknown;
+  lat?: unknown;
+  lng?: unknown;
+  size_pyeong?: unknown;
+  base_price?: unknown;
+  cleaning_deadline_hours?: unknown;
+  spec?: unknown;
+  status?: unknown;
+}
+
+/**
+ * 배차된 발주가 걸린 매물의 주소를 바꿀 때.
+ *
+ * ## 판단: in_progress 만 막고 나머지는 허용한다
+ *
+ * 막고 싶은 유혹이 있다 — 배차된 공급자는 옛 주소를 들고 있고, 조용히 바뀌면
+ * 엉뚱한 곳으로 간다. 하지만 **전면 차단은 아르카가 방금 겪은 문제를 재생산한다.**
+ * 잘못 등록된 매물을 고칠 방법이 없어지는 것이 더 큰 사고다. 호스트가 주소를
+ * 정정하는 것은 실서비스에서 반드시 일어난다.
+ *
+ * 그래서 경계를 "공급자가 이미 현장에 있는가"로 잡는다.
+ *   · in_progress  — 청소가 진행 중이다. 지금 주소를 바꾸는 건 의미가 없고
+ *                    원장만 어지럽힌다. 409 로 막는다
+ *   · accepted     — 배차됐지만 아직 도착 전이다. 정정이 가능해야 한다.
+ *                    대신 응답 warnings 로 "공급자에게 알리라"고 명시한다
+ *   · 그 외        — 자유롭게 허용
+ *
+ * 침묵이 문제였지 변경 자체가 문제가 아니다. 그래서 막는 대신 드러낸다.
+ */
+async function regionChangeBlockers(
+  db: SupabaseClient,
+  propertyId: string,
+): Promise<{ blocked: string[]; dispatched: string[] }> {
+  const { data } = await db.from("orders").select("id, status, tenant_ref")
+    .eq("property_id", propertyId)
+    .in("status", ["accepted", "in_progress"]);
+
+  const rows = (data ?? []) as Array<
+    { id: string; status: string; tenant_ref: string }
+  >;
+  return {
+    blocked: rows.filter((o) => o.status === "in_progress").map((o) => o.id),
+    dispatched: rows.filter((o) => o.status === "accepted").map((o) => o.id),
+  };
+}
+
+async function patchProperty(
+  req: Request,
+  db: SupabaseClient,
+  ctx: TenantContext,
+  propertyId: string,
+): Promise<Response> {
+  let body: PropertyPatchBody;
+  try {
+    body = await req.json();
+  } catch {
+    return errorResponse(req, "validation_failed", {
+      details: ["요청 본문이 올바른 JSON이 아닙니다."],
+    });
+  }
+
+  // env 필터. 같은 유형의 누락이 세 번 나왔다.
+  const { data: found } = await db.from("properties")
+    .select(PROPERTY_COLS + ", lat, lng, address_detail")
+    .eq("id", propertyId).eq("tenant_id", ctx.tenantId).eq("env", ctx.env)
+    .maybeSingle();
+  if (!found) return errorResponse(req, "property_not_found");
+  const prop = found as unknown as PropertyRow & {
+    lat: number | null;
+    lng: number | null;
+  };
+
+  const details: string[] = [];
+  if (body.status != null) {
+    if (!isStr(body.status) || !SETTABLE_STATUS.includes(body.status)) {
+      // pending_coverage 는 서버 판정 결과지 입력값이 아니다.
+      // 클라이언트가 직접 지정하면 커버리지 판정이 무의미해진다.
+      details.push(
+        `status는 ${SETTABLE_STATUS.join(" | ")} 중 하나여야 합니다. ` +
+          "pending_coverage는 서버가 지역 해석 결과로 정합니다.",
+      );
+    }
+  }
+  if (body.address != null && !isStr(body.address)) {
+    details.push("address는 문자열이어야 합니다.");
+  }
+  if (body.lat != null && !isNum(body.lat)) details.push("lat은 숫자여야 합니다.");
+  if (body.lng != null && !isNum(body.lng)) details.push("lng는 숫자여야 합니다.");
+  if (body.base_price != null && !isInt(body.base_price)) {
+    details.push("base_price는 정수(원)여야 합니다.");
+  }
+  if (body.cleaning_deadline_hours != null) {
+    if (!isInt(body.cleaning_deadline_hours) || body.cleaning_deadline_hours <= 0) {
+      details.push("cleaning_deadline_hours는 양의 정수여야 합니다.");
+    }
+  }
+  if (body.size_pyeong != null && !isNum(body.size_pyeong)) {
+    details.push("size_pyeong은 숫자여야 합니다.");
+  }
+  if (
+    body.spec != null &&
+    (typeof body.spec !== "object" || Array.isArray(body.spec))
+  ) {
+    details.push("spec은 객체여야 합니다.");
+  }
+  if (details.length > 0) {
+    return errorResponse(req, "validation_failed", { details });
+  }
+
+  const patch: Record<string, unknown> = {};
+  if (isStr(body.name)) patch.name = body.name;
+  if (body.address_detail !== undefined) {
+    patch.address_detail = isStr(body.address_detail) ? body.address_detail : null;
+  }
+  if (isNum(body.size_pyeong)) patch.size_pyeong = body.size_pyeong;
+  if (isInt(body.base_price)) patch.base_price = body.base_price;
+  if (isInt(body.cleaning_deadline_hours)) {
+    patch.cleaning_deadline_hours = body.cleaning_deadline_hours;
+  }
+  if (body.spec && typeof body.spec === "object") patch.spec = body.spec;
+
+  const warnings: Array<Record<string, string>> = [];
+  const touchesRegion = REGION_FIELDS.some((f) =>
+    (body as Record<string, unknown>)[f] !== undefined
+  );
+
+  let activated = false;
+
+  if (touchesRegion) {
+    const blockers = await regionChangeBlockers(db, prop.id);
+    if (blockers.blocked.length > 0) {
+      return errorResponse(req, "invalid_state_transition", {
+        details: [
+          "청소가 진행 중인 발주가 있어 주소·좌표를 변경할 수 없습니다. " +
+            `(${blockers.blocked.join(", ")})`,
+        ],
+      });
+    }
+    if (blockers.dispatched.length > 0) {
+      warnings.push({
+        code: "dispatched_orders_affected",
+        message:
+          `배차 확정된 발주 ${blockers.dispatched.length}건이 이 매물을 참조합니다. ` +
+          "공급자는 변경 전 주소를 안내받았습니다.",
+        next_action:
+          "공급자에게 주소 변경을 알리십시오. POST /v1/orders/{id}/messages 를 사용할 수 있습니다.",
+      });
+    }
+
+    // POST 와 같은 해석 로직을 쓴다. 우선순위 region_code > lat/lng > address.
+    const region = await resolveRegion(db, {
+      region_code: body.region_code !== undefined
+        ? (body.region_code as string | null)
+        : prop.region_code,
+      lat: body.lat !== undefined
+        ? (body.lat as number | null)
+        : prop.lat,
+      lng: body.lng !== undefined
+        ? (body.lng as number | null)
+        : prop.lng,
+      address: (body.address as string) ?? prop.address,
+    });
+    if (!region) {
+      const gaveCode = body.region_code != null;
+      const gaveCoords = isNum(body.lat) && isNum(body.lng);
+      return errorResponse(req, "region_unresolved", {
+        details: [
+          gaveCode
+            ? `region_code '${body.region_code}' 는 서비스 대상 지역이 아닙니다.`
+            : gaveCoords
+            ? "좌표를 법정동코드로 해석하지 못했습니다. 현재 서울만 지원하며 좌표계는 WGS84여야 합니다."
+            : "region_code 또는 lat/lng 좌표가 필요합니다.",
+        ],
+      });
+    }
+
+    patch.region_code = region.regionCode;
+    if (isStr(body.address)) patch.address = body.address;
+    if (isNum(body.lat)) patch.lat = body.lat;
+    if (isNum(body.lng)) patch.lng = body.lng;
+
+    // 커버리지 재판정. 클라이언트가 status 를 명시했어도 서버 판정이 우선한다 —
+    // 미지원 지역을 active 로 바꿔놓으면 발주가 통과해버린다.
+    if (!region.isServiceable) {
+      patch.status = "pending_coverage";
+    } else if (prop.status === "pending_coverage") {
+      patch.status = "active";
+      activated = true;
+    } else if (isStr(body.status)) {
+      patch.status = body.status;
+    }
+  } else if (isStr(body.status)) {
+    patch.status = body.status;
+  }
+
+  if (Object.keys(patch).length === 0) {
+    return errorResponse(req, "validation_failed", {
+      details: ["변경할 필드가 없습니다."],
+    });
+  }
+
+  const { data: updated, error } = await db.from("properties").update(patch)
+    .eq("id", prop.id).select(PROPERTY_COLS).single();
+  if (error) {
+    console.error(`매물 변경 실패: ${JSON.stringify(error)}`);
+    return errorResponse(req, "db_error");
+  }
+
+  // pending_coverage -> active 는 테넌트가 기다리던 전이다. 통지한다.
+  if (activated) {
+    const { error: whErr } = await db.rpc("enqueue_property_activated", {
+      p_property_id: prop.id,
+    });
+    if (whErr) {
+      console.error(`property.activated 큐 실패: ${JSON.stringify(whErr)}`);
+    }
+  }
+
+  const detail = await toDetail(db, updated as PropertyRow, null);
+  return jsonResponse(req, 200, { ...detail, warnings });
+}
+
+// ---------------------------------------------------------------------------
+
 Deno.serve(async (req) => {
   const pre = handlePreflight(req);
   if (pre) return pre;
@@ -372,9 +624,12 @@ Deno.serve(async (req) => {
   }
 
   const m = path.match(/^\/properties\/([^/]+)$/);
-  if (req.method === "GET" && m) {
-    if (!UUID_PATTERN.test(m[1])) return errorResponse(req, "property_not_found");
-    return await getProperty(req, db, ctx, m[1]);
+  if (m && !UUID_PATTERN.test(m[1])) {
+    return errorResponse(req, "property_not_found");
+  }
+  if (req.method === "GET" && m) return await getProperty(req, db, ctx, m[1]);
+  if (req.method === "PATCH" && m) {
+    return await patchProperty(req, db, ctx, m[1]);
   }
 
   return errorResponse(req, "property_not_found", {
