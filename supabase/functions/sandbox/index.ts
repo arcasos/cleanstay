@@ -294,6 +294,13 @@ async function transition(
     charged_at: next.charged_at,
     fault: next.fault,
     free_change_until: next.free_change_until,
+    // orders EF 와 같은 파생 규칙. 값은 그대로 두고 상태만 따로 준다 —
+    // null 이 "배차 전 = 언제든 무보상"을 뜻하므로 시한 경과에 null 을 쓸 수 없다.
+    free_change_status: next.free_change_until === null
+      ? "unlimited"
+      : (Date.now() <= new Date(next.free_change_until).getTime()
+        ? "until"
+        : "expired"),
     // 공급자는 배차되지 않았다. sandbox 전이는 공급자를 만들지 않는다.
     provider: null,
     amounts: {

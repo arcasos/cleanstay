@@ -75,6 +75,7 @@ interface PropertyRow {
   status: string;
   base_price: number | null;
   cleaning_deadline_hours: number;
+  region_code: string | null;
 }
 
 interface OrderRow {
@@ -296,7 +297,7 @@ async function createOrder(
 
   // --- 매물 --------------------------------------------------------------
   let q = db.from("properties")
-    .select("id, host_id, status, base_price, cleaning_deadline_hours")
+    .select("id, host_id, status, base_price, cleaning_deadline_hours, region_code")
     .eq("tenant_id", ctx.tenantId)
     .eq("env", ctx.env);
   q = isStr(body.property_id)
@@ -308,11 +309,45 @@ async function createOrder(
   if (!propData) return errorResponse(req, "property_not_found");
   const property = propData as PropertyRow;
 
-  if (property.status === "pending_coverage") {
+  if (property.status === "inactive") {
+    return errorResponse(req, "property_inactive");
+  }
+
+  // --- 커버리지: 지역을 직접 확인한다 -------------------------------------
+  //
+  // property.status 만 믿으면 안 된다. 그건 cron 이 갱신하는 **파생값**이고,
+  // 커버리지가 바뀐 시점과 cron 이 도는 시점 사이에 신뢰 창이 생긴다.
+  // 그 창에서 미지원 지역에 발주가 들어가거나, 이미 열린 지역이 막힌다.
+  //
+  // region_codes 를 직접 보고 판정한 뒤, 어긋난 property.status 를 그 자리에서
+  // 정정한다. cron 을 기다릴 이유가 없다.
+  const { data: regionRow } = await db.from("region_codes")
+    .select("is_serviceable")
+    .eq("code", property.region_code ?? "")
+    .maybeSingle();
+  const serviceable =
+    (regionRow as { is_serviceable: boolean } | null)?.is_serviceable === true;
+
+  if (!serviceable) {
+    // 지역이 미지원이다. status 가 active 로 남아 있으면 지금 바로잡는다.
+    if (property.status !== "pending_coverage") {
+      await db.from("properties")
+        .update({ status: "pending_coverage" }).eq("id", property.id);
+    }
     return errorResponse(req, "property_pending_coverage");
   }
-  if (property.status !== "active") {
-    return errorResponse(req, "property_inactive");
+
+  if (property.status === "pending_coverage") {
+    // 지역은 열렸는데 status 가 아직 따라오지 못했다. 발주를 막을 이유가 없다.
+    // 정정하고 진행하며, 테넌트가 기다리던 전이이므로 통지한다.
+    await db.from("properties")
+      .update({ status: "active" }).eq("id", property.id);
+    const { error: whErr } = await db.rpc("enqueue_property_activated", {
+      p_property_id: property.id,
+    });
+    if (whErr) {
+      console.error(`property.activated 큐 실패: ${JSON.stringify(whErr)}`);
+    }
   }
 
   // --- 마감 기한 ----------------------------------------------------------
