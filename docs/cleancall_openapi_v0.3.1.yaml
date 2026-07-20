@@ -1265,6 +1265,37 @@ components:
             반대로 뒤로 미뤄지는 경우는 호스트에게 유리하므로 그대로 갱신됩니다.
             테넌트 요청으로 일정이 변경된 경우에는 새 `scheduled_at` 기준으로
             재계산됩니다.
+
+            ### 시한이 지난 경우 (v0.3.2)
+            **값을 지우지 않습니다.** 과거 시각이 그대로 내려갑니다.
+            분기는 `free_change_status`로 하십시오 — 값을 `null`로 바꾸면
+            "배차 전 = 언제든 무보상"과 의미가 겹칩니다.
+        free_change_status:
+          type: string
+          enum: [unlimited, until, expired]
+          description: |
+            무보상 변경·취소 가능 여부 (v0.3.2 추가).
+            `free_change_until` 하나로는 분기할 수 없어 추가된 필드입니다 —
+            `null`이 "배차 전 = 언제든 무보상"을 뜻하므로, 시한이 지난 경우에도
+            `null`을 내리면 **정반대 의미가 겹칩니다.**
+
+            | 값 | 의미 | `free_change_until` |
+            |---|---|---|
+            | `unlimited` | 배차 전. 언제든 무보상 | `null` |
+            | `until` | 배차 후, 아직 시한 전 | 미래 시각 |
+            | `expired` | 시한 경과 | **과거 시각 그대로** |
+
+            `expired`에서도 값을 유지하는 이유는 호스트에게 "N월 N일까지였습니다"를
+            보여줄 수 있어야 하기 때문입니다. 지우면 그 정보가 사라집니다.
+
+            ⚠️ **이 값은 응답 시점 기준입니다.** 저장하지 마십시오 —
+            시간이 지나면 `until`이 `expired`가 됩니다. 캐시한다면
+            `free_change_until`로 다시 계산하십시오.
+            webhook payload에도 포함되지만 그쪽은 `occurred_at` 기준입니다.
+
+            ⚠️ `expired`는 "무보상 시한이 지났다"이지 **"변경이 불가능하다"가 아닙니다.**
+            종료 상태(`completed`·`charged`·`cancelled` 등)에서는 변경 자체가 `409`입니다.
+            `status`를 함께 확인하십시오.
         access_info:
           type: object
           description: |

@@ -162,6 +162,31 @@ function warningsFor(g: Gates): Warning[] {
   return w;
 }
 
+/**
+ * 무보상 변경 가능 여부의 3-상태.
+ *
+ * `free_change_until` 만으로는 수신 측이 분기할 수 없다 —
+ * `null` 이 "배차 전 = 언제든 무보상"을 뜻하는데, 시한이 지난 경우에도 `null` 을
+ * 내리면 정반대 의미가 겹친다. 그래서 값은 그대로 두고 상태를 따로 준다.
+ *
+ *   unlimited — 배차 전. `free_change_until` 은 null 이고 언제든 무보상
+ *   until     — 배차 후, 아직 시한 전. `free_change_until` 이 미래
+ *   expired   — 시한 경과. `free_change_until` 은 **과거 시각 그대로 유지**한다.
+ *               지우면 "언제까지였는지"가 사라져 호스트에게 설명할 수 없다
+ *
+ * ⚠️ 이 값은 **응답 시점 기준**이다. 저장하지 않는다 — 시간이 지나면 until 이
+ *    expired 가 되므로 저장하면 즉시 낡는다. 수신 측이 캐시한다면
+ *    `free_change_until` 로 다시 계산해야 한다.
+ *
+ * ⚠️ `expired` 는 "무보상 시한이 지났다"이지 "변경이 불가능하다"가 아니다.
+ *    종료 상태(completed·charged·cancelled 등)에서는 변경 자체가 409 다.
+ *    수신 측은 `status` 를 함께 봐야 한다.
+ */
+function freeChangeStatus(freeChangeUntil: string | null): string {
+  if (!freeChangeUntil) return "unlimited";
+  return Date.now() <= new Date(freeChangeUntil).getTime() ? "until" : "expired";
+}
+
 function toOrder(row: OrderRow, g: Gates): Record<string, unknown> {
   return {
     order_id: row.id,
@@ -181,6 +206,7 @@ function toOrder(row: OrderRow, g: Gates): Record<string, unknown> {
     fault: row.fault,
     // 배차 전에는 null이며 언제든 무보상이다. 배차 후 scheduled_at - 24h 로 채워진다.
     free_change_until: row.free_change_until,
+    free_change_status: freeChangeStatus(row.free_change_until),
     access_info: {
       status: g.accessRegistered ? "registered" : "not_registered",
       updated_at: g.accessUpdatedAt,
