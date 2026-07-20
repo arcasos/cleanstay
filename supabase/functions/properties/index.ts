@@ -529,20 +529,45 @@ async function patchProperty(
       });
     }
 
-    // POST 와 같은 해석 로직을 쓴다. 우선순위 region_code > lat/lng > address.
-    const region = await resolveRegion(db, {
-      region_code: body.region_code !== undefined
-        ? (body.region_code as string | null)
-        : prop.region_code,
-      lat: body.lat !== undefined
-        ? (body.lat as number | null)
-        : prop.lat,
-      lng: body.lng !== undefined
-        ? (body.lng as number | null)
-        : prop.lng,
-      address: (body.address as string) ?? prop.address,
-    });
-    if (!region) {
+    // POST 와 같은 해석 로직을 쓰되, **입력으로 준 것만** 근거로 삼는다.
+    //
+    // ⚠️ 저장된 region_code 로 폴백하면 안 된다. resolveRegion 의 우선순위가
+    //    region_code > lat/lng 이므로, 폴백하면 새로 준 좌표가 옛 코드에 밀린다.
+    //    좌표로는 영영 고칠 수 없게 되고, 그게 아르카가 겪은 상황이다.
+    //    region_code 는 해석 결과(파생값)지 입력이 아니다.
+    let region = null;
+    let regionSkipped = false;
+
+    if (body.region_code !== undefined) {
+      // 1순위 — 명시된 코드
+      region = await resolveRegion(db, {
+        region_code: body.region_code as string | null,
+      });
+    } else if (body.lat !== undefined || body.lng !== undefined) {
+      // 2순위 — 좌표. 한쪽만 줬으면 나머지는 기존 값으로 채운다.
+      region = await resolveRegion(db, {
+        lat: (body.lat !== undefined ? body.lat : prop.lat) as number | null,
+        lng: (body.lng !== undefined ? body.lng : prop.lng) as number | null,
+      });
+    } else {
+      // address 만 바뀌었다. 지오코딩은 범위 밖이라 재해석할 근거가 없다.
+      // 기존 지역을 유지하되, 재해석하지 않았다는 사실을 숨기지 않는다 —
+      // "강남구 -> 종로구"처럼 지역이 실제로 바뀌는 정정일 수 있다.
+      regionSkipped = true;
+    }
+
+    if (regionSkipped) {
+      warnings.push({
+        code: "region_not_reresolved",
+        message:
+          "주소 문자열만 변경되어 지역을 재해석하지 않았습니다. " +
+          `region_code 는 ${prop.region_code} 그대로입니다.`,
+        next_action:
+          "지역이 실제로 바뀌었다면 lat/lng 또는 region_code 를 함께 보내십시오.",
+      });
+      if (isStr(body.address)) patch.address = body.address;
+      if (isStr(body.status)) patch.status = body.status;
+    } else if (!region) {
       const gaveCode = body.region_code != null;
       const gaveCoords = isNum(body.lat) && isNum(body.lng);
       return errorResponse(req, "region_unresolved", {
@@ -554,22 +579,22 @@ async function patchProperty(
             : "region_code 또는 lat/lng 좌표가 필요합니다.",
         ],
       });
-    }
+    } else {
+      patch.region_code = region.regionCode;
+      if (isStr(body.address)) patch.address = body.address;
+      if (isNum(body.lat)) patch.lat = body.lat;
+      if (isNum(body.lng)) patch.lng = body.lng;
 
-    patch.region_code = region.regionCode;
-    if (isStr(body.address)) patch.address = body.address;
-    if (isNum(body.lat)) patch.lat = body.lat;
-    if (isNum(body.lng)) patch.lng = body.lng;
-
-    // 커버리지 재판정. 클라이언트가 status 를 명시했어도 서버 판정이 우선한다 —
-    // 미지원 지역을 active 로 바꿔놓으면 발주가 통과해버린다.
-    if (!region.isServiceable) {
-      patch.status = "pending_coverage";
-    } else if (prop.status === "pending_coverage") {
-      patch.status = "active";
-      activated = true;
-    } else if (isStr(body.status)) {
-      patch.status = body.status;
+      // 커버리지 재판정. 클라이언트가 status 를 명시했어도 서버 판정이 우선한다 —
+      // 미지원 지역을 active 로 바꿔놓으면 발주가 통과해버린다.
+      if (!region.isServiceable) {
+        patch.status = "pending_coverage";
+      } else if (prop.status === "pending_coverage") {
+        patch.status = "active";
+        activated = true;
+      } else if (isStr(body.status)) {
+        patch.status = body.status;
+      }
     }
   } else if (isStr(body.status)) {
     patch.status = body.status;
