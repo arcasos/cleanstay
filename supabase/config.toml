@@ -440,3 +440,6 @@ verify_jwt = false
 # 검증할 caller 가 없는 것이 설계이며, 참조 데이터 읽기만 한다.
 [functions.coverage]
 verify_jwt = false
+
+[functions.providers]
+verify_jwt = false
